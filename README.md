@@ -61,7 +61,7 @@ No account, no cloud, no telemetry. The optional AI model runs on your Mac; your
 <td width="50%" valign="top">
 
 **💬 Chat that actually does things**<br/>
-Create, move, rename, delete, sort, de-duplicate, change extensions — with folder-name fuzziness (“life and hell” → `liveandhell-template`), lists (“delete A, B and C”) and follow-ups (“delete all of them”).
+Create, move, rename, delete, sort, de-duplicate, change extensions — with folder-name fuzziness (“life and hell” → `liveandhell-template`), lists (“delete A, B and C”), **multi-step requests** (“rename X to Y and move it into Z”, “create a folder Invoices and move the PDFs into it”) and follow-ups (“delete all of them”).
 
 <img src="docs/assets/screenshots/chat-plan.png" alt="Chat proposing a reviewed plan" />
 
@@ -115,6 +115,7 @@ The shrink button turns Tidy into a 360×580 assistant pinned to a screen corner
 | “**What's taking the most space?**” | Cards for every top-level folder with sizes and bars; click one to open it. | ![](docs/assets/demo/space.gif) |
 | “**Remove the curseforge instances that are not the 26.2 version**” | Reads each instance's own version file, keeps the matches, lists the rest whole. | ![](docs/assets/demo/instances.gif) |
 | “**Organize this folder by type**” | Images, Documents, Installers… in reviewed 500-item batches; **Undo all** restores it. | ![](docs/assets/demo/organize.gif) |
+| “**Rename setup.dmg to Installer and move it into Archive**” | Two steps, one reviewed plan and one approval; **Put back** undoes both at once. | — |
 | “**Replace spaces with underscores in file names**” | Bulk renames with collision checks; contents never change. | ![](docs/assets/demo/rename.gif) |
 | “**Find duplicate files and remove the extra copies**” | Hashes files of equal size, keeps the oldest, trashes the rest. | ![](docs/assets/demo/duplicates.gif) |
 | “**List all my projects**” | Finds them by `package.json`, `Cargo.toml`, `.git`… with type and last change. | ![](docs/assets/demo/projects.gif) |

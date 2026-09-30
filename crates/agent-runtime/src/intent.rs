@@ -1021,7 +1021,7 @@ fn help(ctx: &Ctx) -> Investigation {
         "Ready",
         "No model needed for these requests".into(),
         format!(
-            "I can look through {} ({}) and get things done — just tell me what you want:\n\n• “Delete the Lucky World Invasion folder”\n• “Remove all .log files older than 3 months”\n• “Rename the Old Stuff folder to Archive”\n• “Create a folder called Invoices”\n• “Move all PDFs into Documents/PDFs”\n• “Delete the 10 biggest files”\n• “List all my projects”\n• “Clean up build artifacts and node_modules”\n• “Organize this folder by type” or “by date”\n• “What’s taking the most space?”\n• “Find invoice”\n\nEverything goes to the Trash after you approve a preview, so it can always be restored from Finder.",
+            "I can look through {} ({}) and get things done — just tell me what you want:\n\n• “Delete the Lucky World Invasion folder”\n• “Remove all .log files older than 3 months”\n• “Rename the Old Stuff folder to Archive”\n• “Create a folder called Invoices”\n• “Rename setup.dmg to Installer and move it into Archive” (two steps, one approval)\n• “Move all PDFs into Documents/PDFs”\n• “Delete the 10 biggest files”\n• “List all my projects”\n• “Clean up build artifacts and node_modules”\n• “Organize this folder by type” or “by date”\n• “What’s taking the most space?”\n• “Find invoice”\n\nEverything goes to the Trash after you approve a preview, so it can always be restored from Finder.",
             plural(ctx.files.len(), "indexed file", "indexed files"),
             ctx.scope
         ),
@@ -2094,6 +2094,89 @@ mod tests {
             f(12, "Downloads/Screenshot 2026-01-01.png", 60, 0),
         ]
     }
+    fn only_action(q: &str) -> ProposedAction {
+        let r = run(q);
+        assert_eq!(r.proposal.actions.len(), 1, "{q}: {}", r.proposal.rationale);
+        r.proposal.actions[0].clone()
+    }
+    #[test]
+    fn multi_step_rename_then_move_a_file_is_one_plan() {
+        for q in [
+            "rename setup.dmg to Installer and move it into Archive",
+            "rename setup.dmg to Installer, then move it to Archive",
+            "move setup.dmg into Archive and rename it to Installer",
+            "please rename the file setup.dmg as Installer and put it in Archive",
+        ] {
+            match only_action(q) {
+                ProposedAction::Move {
+                    source,
+                    destination_relative,
+                } => {
+                    assert_eq!(source, FileId(7), "{q}");
+                    assert_eq!(
+                        destination_relative,
+                        PathBuf::from("Archive/Installer.dmg"),
+                        "{q}"
+                    );
+                }
+                other => panic!("{q}: {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn multi_step_rename_and_move_a_folder() {
+        match only_action("rename the FTB StoneBlock 4 folder to StoneBlock and move it into proj")
+        {
+            ProposedAction::MoveFolder {
+                source,
+                destination_relative,
+            } => {
+                assert!(source.ends_with("FTB StoneBlock 4"), "{source:?}");
+                assert_eq!(destination_relative, PathBuf::from("proj/StoneBlock"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    #[test]
+    fn multi_step_refuses_to_overwrite_and_reports_missing_items() {
+        let r = run("rename old.log to new.log and move it into Downloads");
+        assert!(r.proposal.actions.is_empty());
+        assert!(
+            r.proposal.rationale.contains("already exists"),
+            "{}",
+            r.proposal.rationale
+        );
+        let r = run("rename nosuchfile.txt to x and move it into Archive");
+        assert!(r.proposal.actions.is_empty());
+        assert!(r.clarification.is_some());
+    }
+    #[test]
+    fn multi_step_create_a_folder_and_move_into_it() {
+        match only_action("create a folder called Installers and move setup.dmg into it") {
+            ProposedAction::Move {
+                destination_relative,
+                ..
+            } => assert_eq!(destination_relative, PathBuf::from("Installers/setup.dmg")),
+            other => panic!("{other:?}"),
+        }
+        let r = run("make a new folder named Logs and then move all log files into it");
+        assert_eq!(r.proposal.actions.len(), 2, "{}", r.proposal.rationale);
+        assert!(r.proposal.actions.iter().all(|a| matches!(
+            a,
+            ProposedAction::Move { destination_relative, .. } if destination_relative.starts_with("Logs")
+        )));
+    }
+    #[test]
+    fn single_step_rename_and_move_still_work() {
+        assert!(matches!(
+            only_action("rename setup.dmg to Installer"),
+            ProposedAction::Rename { .. }
+        ));
+        assert!(matches!(
+            only_action("move setup.dmg into Archive"),
+            ProposedAction::Move { .. }
+        ));
+    }
     fn run(q: &str) -> Investigation {
         respond(q, &fixture(), "Documents", 9_000_000_100)
             .unwrap_or_else(|| panic!("unhandled: {q}"))
@@ -2833,12 +2916,300 @@ fn folder_exists(path: &Path, files: &[FileCandidate], folders: &[Folder]) -> bo
     folders.iter().any(|f| f.path == path) || files.iter().any(|f| f.relative_path == path)
 }
 /// Move / rename / create-folder requests. Names keep the capitalization the user typed.
+const MOVE_VERBS: &[&str] = &["move", "put", "send", "relocate", "transfer", "shift"];
+const DEST_MARKERS: &[&str] = &["to", "into", "in", "inside", "under", "within", "onto"];
+fn is_connector(word: &str) -> bool {
+    matches!(word, "and" | "then" | "also" | "," | "afterwards" | "after")
+}
+fn position_from(words: &[String], from: usize, list: &[&str]) -> Option<usize> {
+    words
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, w)| list.contains(&w.as_str()))
+        .map(|(i, _)| i)
+}
+/// Two-step requests folded into ONE reviewable plan, so nothing depends on the order things run in:
+///   “rename X to Y and move it into Z”  (or “move X into Z and rename it to Y”) → one move that also renames
+///   “create a folder Z and move X into it”                                     → the move creates Z
+fn multi_step(
+    ctx: &Ctx,
+    raw: &[String],
+    words: &[String],
+    folders: &[Folder],
+) -> Option<Investigation> {
+    let rename_at = position_from(words, 0, &["rename"]);
+    let move_at = position_from(words, 0, MOVE_VERBS);
+    if let (Some(r), Some(m)) = (rename_at, move_at) {
+        if negated(words, r) || negated(words, m) {
+            return None;
+        }
+        let pronouns = ["it", "them", "that", "this", "the", "then", "also", "and"];
+        let skip = |at: usize| {
+            let mut i = at;
+            while i < words.len() && pronouns.contains(&words[i].as_str()) {
+                i += 1;
+            }
+            i
+        };
+        // (subject, new name, destination words, destination raw words)
+        let parsed = if r < m {
+            // rename <X> to <Y> and move it into <Z>
+            let to_at = position_from(words, r + 1, &["to", "as", "into"]).filter(|t| *t < m)?;
+            let c = (to_at + 1..m).find(|i| is_connector(&words[*i]))?;
+            let subject = words[r + 1..to_at].to_vec();
+            let new_name = clean_name(&raw[to_at + 1..c]);
+            let dm = position_from(words, skip(m + 1), DEST_MARKERS)?;
+            (
+                subject,
+                new_name,
+                words[dm + 1..].to_vec(),
+                raw[dm + 1..].to_vec(),
+            )
+        } else {
+            // move <X> into <Z> and rename it to <Y>
+            let dm = position_from(words, m + 1, DEST_MARKERS).filter(|d| *d < r)?;
+            let c = (dm + 1..r).rev().find(|i| is_connector(&words[*i]))?;
+            let subject = words[m + 1..dm].to_vec();
+            let to_at = position_from(words, skip(r + 1), &["to", "as", "into"])?;
+            let new_name = clean_name(&raw[to_at + 1..]);
+            (
+                subject,
+                new_name,
+                words[dm + 1..c].to_vec(),
+                raw[dm + 1..c].to_vec(),
+            )
+        };
+        let (subject, new_name, dest_words, dest_raw) = parsed;
+        // Bulk renames (“all pdfs”, “every screenshot”) are handled elsewhere.
+        if has(&subject, &["all", "every", "each", "any"]) {
+            return None;
+        }
+        let subject: Vec<String> = subject
+            .into_iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .collect();
+        if subject.is_empty() || new_name.is_empty() || new_name.contains('/') {
+            return None;
+        }
+        let dest_phrase: Vec<String> = dest_words
+            .iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .cloned()
+            .collect();
+        if dest_phrase.is_empty() {
+            return None;
+        }
+        return rename_and_move(ctx, &subject, &new_name, &dest_phrase, &dest_raw, folders);
+    }
+    // create a folder <Z> [in <P>] and move <X> into it
+    let create_at = position_from(words, 0, &["create", "make", "add"])?;
+    let m = move_at.filter(|m| *m > create_at)?;
+    if negated(words, create_at) || negated(words, m) {
+        return None;
+    }
+    let folder_at = position_from(words, create_at + 1, &["folder", "directory"])?;
+    if folder_at >= m {
+        return None;
+    }
+    let start = position_from(words, create_at + 1, &["called", "named"])
+        .map(|i| i + 1)
+        .unwrap_or(folder_at + 1);
+    let end = (start..m).find(|i| {
+        is_connector(&words[*i]) || DEST_MARKERS.contains(&words[*i].as_str()) && words[*i] != "to"
+    })?;
+    let name = clean_name(&raw[start..end]);
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    // Optional parent: “… in Downloads and …”
+    let mut full = name.clone();
+    if DEST_MARKERS.contains(&words[end].as_str()) {
+        let c = (end + 1..m).rev().find(|i| is_connector(&words[*i]))?;
+        let parent: Vec<String> = words[end + 1..c]
+            .iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .cloned()
+            .collect();
+        let dir = resolve(&parent, folders).first().map(|f| f.path.clone())?;
+        full = format!("{}/{}", dir.display(), name);
+    }
+    // The destination of the move must be “it” / “there” (the folder just named).
+    let dm = position_from(words, m + 1, DEST_MARKERS)?;
+    let tail: Vec<&String> = words[dm + 1..]
+        .iter()
+        .filter(|w| !matches!(w.as_str(), "the" | "new" | "that" | "folder" | "directory"))
+        .collect();
+    if !matches!(tail.as_slice(), [w] if matches!(w.as_str(), "it" | "there" | "inside")) {
+        return None;
+    }
+    let mut words2: Vec<String> = words[m..dm].to_vec();
+    words2.push("into".into());
+    words2.push(full.to_lowercase());
+    let mut raw2: Vec<String> = raw[m..dm].to_vec();
+    raw2.push("into".into());
+    raw2.push(full);
+    structural(ctx, &raw2, &words2, folders)
+}
+fn rename_and_move(
+    ctx: &Ctx,
+    subject: &[String],
+    new_name: &str,
+    dest_phrase: &[String],
+    dest_raw: &[String],
+    folders: &[Folder],
+) -> Option<Investigation> {
+    let workflow = "rename_and_move";
+    let (dest_dir, dest_note) = match resolve(dest_phrase, folders).first() {
+        Some(f) => (f.path.clone(), String::new()),
+        None => {
+            let rel = safe_relative(&clean_name(dest_raw))?;
+            let note = format!(
+                " “{}” doesn’t exist yet, so it will be created.",
+                rel.display()
+            );
+            (rel, note)
+        }
+    };
+    let nothing = |detail: &str, text: String| {
+        reply(
+            ctx,
+            workflow,
+            "Understood your request",
+            detail.into(),
+            text,
+        )
+    };
+    if let Some(folder) = resolve(subject, folders)
+        .into_iter()
+        .find(|f| f.path != dest_dir)
+    {
+        let dest = dest_dir.join(new_name);
+        if dest.starts_with(&folder.path) {
+            return Some(nothing(
+                "Rename and move folder",
+                "A folder can’t be moved inside itself. Nothing changed.".into(),
+            ));
+        }
+        if folder_exists(&dest, ctx.files, folders) {
+            return Some(nothing(
+                "Rename and move folder",
+                format!(
+                    "“{}” already exists, so I won’t overwrite it. Nothing changed.",
+                    dest.display()
+                ),
+            ));
+        }
+        return Some(plan_reply(
+            ctx,
+            workflow,
+            "Understood your request",
+            format!(
+                "Rename {} → {} and move it",
+                folder.path.display(),
+                dest.display()
+            ),
+            format!(
+                "Two steps, one approval: rename the folder “{}” to “{new_name}” and move it into “{}”.{dest_note} Everything inside stays together. Undo it from History.",
+                folder.path.display(),
+                dest_dir.display()
+            ),
+            vec![ProposedAction::MoveFolder {
+                source: folder.path.clone(),
+                destination_relative: dest,
+            }],
+            vec![],
+        ));
+    }
+    let needle = alnum(
+        &subject
+            .iter()
+            .filter(|w| !matches!(w.as_str(), "file" | "files"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(""),
+    );
+    let mut hits: Vec<&FileCandidate> = ctx
+        .files
+        .iter()
+        .filter(|f| {
+            f.relative_path.file_name().is_some_and(|n| {
+                let n = alnum(&n.to_string_lossy());
+                n == needle || n.starts_with(&needle) && needle.len() > 3
+            })
+        })
+        .collect();
+    hits.sort_by_key(|f| f.relative_path.components().count());
+    let Some(file) = hits.first() else {
+        let mut r = nothing(
+            "Looked for what to rename and move",
+            format!(
+                "I couldn’t find “{}” to rename and move. Try its exact name, for example “rename setup.dmg to Installer and move it into Archive”.",
+                subject.join(" ")
+            ),
+        );
+        r.clarification = Some(r.proposal.rationale.clone());
+        return Some(r);
+    };
+    let ext = file
+        .relative_path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned());
+    let final_name = match (&ext, Path::new(new_name).extension()) {
+        (Some(e), None) => format!("{new_name}.{e}"),
+        _ => new_name.to_string(),
+    };
+    let dest = dest_dir.join(&final_name);
+    if folder_exists(&dest, ctx.files, folders) {
+        return Some(nothing(
+            "Rename and move file",
+            format!(
+                "“{}” already exists, so I won’t overwrite it. Nothing changed.",
+                dest.display()
+            ),
+        ));
+    }
+    let mut r = plan_reply(
+        ctx,
+        workflow,
+        "Understood your request",
+        format!(
+            "Rename {} → {} and move it",
+            file.relative_path.display(),
+            dest.display()
+        ),
+        format!(
+            "Two steps, one approval: rename “{}” to “{final_name}”{} and move it into “{}”.{dest_note} Undo it from History.",
+            file.relative_path.display(),
+            if ext.is_some() && Path::new(new_name).extension().is_none() {
+                " (keeping its extension)"
+            } else {
+                ""
+            },
+            dest_dir.display()
+        ),
+        vec![ProposedAction::Move {
+            source: file.id,
+            destination_relative: dest,
+        }],
+        vec![Source {
+            id: file.id.0,
+            path: file.relative_path.to_string_lossy().into(),
+            size: file.size,
+        }],
+    );
+    r.examined = 1;
+    Some(r)
+}
 fn structural(
     ctx: &Ctx,
     raw: &[String],
     words: &[String],
     folders: &[Folder],
 ) -> Option<Investigation> {
+    if let Some(r) = multi_step(ctx, raw, words, folders) {
+        return Some(r);
+    }
     if let Some(r) = bulk_ops(ctx, raw, words, folders) {
         return Some(r);
     }
@@ -3086,7 +3457,18 @@ fn structural(
             }
         };
         let criteria = parse_criteria(&thing, folders);
-        if criteria.targets_files() {
+        // “the Old Stuff folder” names a folder even though “old” also reads as an age filter.
+        let names_a_folder = has(&thing, &["folder", "directory"])
+            && !resolve(
+                &thing
+                    .iter()
+                    .filter(|w| !FILLER.contains(&w.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                folders,
+            )
+            .is_empty();
+        if criteria.targets_files() && !names_a_folder {
             let mut hits: Vec<&FileCandidate> = ctx
                 .files
                 .iter()

@@ -1,6 +1,7 @@
 # Changelog
 
 ## 1.0.0 — first stable release
+- **Multi-step requests:** “rename X to Y and move it into Z” (or “move X into Z and rename it to Y”) and “create a folder Z and move X into it” now work as one reviewed plan with a single approval, for files and whole folders. Nothing is overwritten, and Put back restores the original name and place in one step. A folder named explicitly (“the Old Stuff folder”) is no longer mistaken for an age filter when moving.
 - **Read-only folders can be trashed or moved:** Tidy makes the approved folder writable just for the move and restores its permissions (also on Put back); partial failures say what already ran and drop finished items from the plan.
 - **Chat remembers the last listing:** “how come some have no size?”, “measure them”, “only the Rust ones”, “biggest first”, “delete them”. Project sizes missing from the index are read from disk.
 - Names prefer a project over a same-named folder deep inside its build output (“chef mod”).

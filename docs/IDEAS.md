@@ -6,7 +6,11 @@ Everything here is open for anyone to pick up. Comment on (or open) an issue fir
 - [ ] **GFI** “Delete empty folders” (needs an index of empty dirs or a disk walk)
 - [ ] **GFI** More category mappings and synonyms (`concept_names`, `kind_exts`): ebooks, fonts, 3D models, design files
 - [ ] “Sort photos into Photos/YEAR/MONTH” without an AI model (compose date + kind)
-- [ ] Multi-step requests: “rename X to Y and move it into Z”
+- [x] Multi-step requests: “rename X to Y and move it into Z”, “move X into Z and rename it”, “create a folder Z and move X into it” (one plan, one approval; see `multi_step` in `intent.rs`)
+- [ ] Longer chains and other verb pairs: “move X into Z, then organize Z by type”, “copy X to Z and rename the copy”, “rename X to Y and trash the old copies”
+- [ ] **GFI** Multi-step with lists and filters: “rename these three folders to A, B, C and move them into Z”; “move all PDFs into Invoices and rename them by date”
+- [ ] **GFI** Multi-step requests that mix folders and files in one sentence (“move the Old Stuff folder and setup.dmg into Archive”)
+- [ ] Show multi-step plans as a before → after tree in the review sheet instead of one line per action
 - [ ] Undo by chat: “undo the last change” / “put back the folder I deleted”
 - [ ] Localization of request phrases (French, Spanish, German…)
 

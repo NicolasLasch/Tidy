@@ -107,6 +107,31 @@ fn old_files_are_found_by_age_and_trashed_then_put_back() {
 }
 
 #[test]
+fn rename_and_move_in_one_request_then_undo() {
+    let mut env = Env::with("multistep", mock::build);
+    // One sentence, one reviewable plan, one approval.
+    let r = env.ask("rename setup.dmg to Installer and move it into Documents/Apps");
+    assert_eq!(r.proposal.actions.len(), 1, "{}", r.proposal.rationale);
+    let tx = env.run_actions(&r.proposal.actions);
+    assert!(env.path("Documents/Apps/Installer.dmg").exists());
+    assert!(!env.path("Downloads/setup.dmg").exists());
+    assert!(env.indexed("Documents/Apps/Installer.dmg"));
+    // Undo restores the original name and place.
+    let undo = env.engine.request_undo_approval(&env.root, tx).unwrap();
+    env.engine
+        .execute_approved_undo(&env.root, tx, &undo.token)
+        .unwrap();
+    assert!(env.path("Downloads/setup.dmg").exists());
+    assert!(!env.path("Documents/Apps/Installer.dmg").exists());
+    env.scan();
+    // A folder with content: create the destination and move into it in one go.
+    let r = env.ask("create a folder called Keepsakes and move the Old Stuff folder into it");
+    assert_eq!(r.proposal.actions.len(), 1, "{}", r.proposal.rationale);
+    env.run_actions(&r.proposal.actions);
+    assert!(env.path("Keepsakes/Old Stuff/a.txt").exists());
+}
+
+#[test]
 fn create_move_rename_and_undo() {
     let mut env = Env::with("edit", mock::build);
     // Create.

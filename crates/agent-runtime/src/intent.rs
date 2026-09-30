@@ -179,6 +179,10 @@ fn folders_of(files: &[FileCandidate]) -> Vec<Folder> {
 }
 /// Best-matching folders for a spoken name; equal-quality matches are ordered by size.
 fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
+    resolve_q(phrase, folders).0
+}
+/// Like `resolve`, plus how good the match is (0 = nothing, 10 = the exact name).
+fn resolve_q<'a>(phrase: &[String], folders: &'a [Folder]) -> (Vec<&'a Folder>, i32) {
     if let [only] = phrase
         && only.contains('/')
     {
@@ -191,37 +195,51 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
             })
             .collect();
         exact.sort_by_key(|f| (f.path.components().count(), std::cmp::Reverse(f.bytes)));
-        return exact;
+        let tier = if exact.is_empty() { 0 } else { 10 };
+        return (exact, tier);
     }
+    // A name that itself contains “and” (“life and hell”) is tried whole before the filler is dropped.
+    let whole_norm: Option<String> = phrase
+        .iter()
+        .any(|w| matches!(w.as_str(), "and" | "&"))
+        .then(|| phrase.iter().map(|w| alnum(w)).collect());
     let phrase: Vec<&String> = phrase
         .iter()
         .filter(|w| !FILLER.contains(&w.as_str()))
         .collect();
     if phrase.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
     let phrase_norm: String = phrase.iter().map(|w| alnum(w)).collect();
     if phrase_norm.len() < 2 {
-        return vec![];
+        return (vec![], 0);
     }
-    let mut scored: Vec<(i32, &Folder)> = folders
+    // (effective score, tier, folder)
+    let mut scored: Vec<(i32, i32, &Folder)> = folders
         .iter()
         .filter_map(|f| {
             if f.name_norm.is_empty() {
                 return None;
             }
-            let score: u8 = if f.name_norm == phrase_norm {
-                4
+            let (score, tier): (u8, i32) = if f.name_norm == phrase_norm
+                || whole_norm.as_deref() == Some(f.name_norm.as_str())
+            {
+                (4, 10)
+            } else if whole_norm
+                .as_deref()
+                .is_some_and(|w| w.len() >= 6 && f.name_norm.contains(w))
+            {
+                (3, 8)
             } else if phrase.iter().all(|p| {
                 f.name_tokens
                     .iter()
                     .any(|t| t == *p || (p.len() >= 3 && t.starts_with(p.as_str())))
             }) {
-                3
+                (3, 7)
             } else if phrase_norm.len() >= 4 && f.name_norm.contains(&phrase_norm) {
-                2
+                (2, 5)
             } else if f.name_norm.len() >= 4 && phrase_norm.contains(&f.name_norm) {
-                1
+                (1, 3)
             } else {
                 return None;
             };
@@ -233,7 +251,7 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
             if in_build_output(&f.path) {
                 effective -= 6;
             }
-            Some((effective, f))
+            Some((effective, tier, f))
         })
         .collect();
     if scored.is_empty() {
@@ -264,9 +282,9 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
                         })
                 });
                 if covers {
-                    Some((1, f))
+                    Some((1, 5, f))
                 } else if distinctive {
-                    Some((0, f))
+                    Some((0, 3, f))
                 } else {
                     None
                 }
@@ -285,13 +303,14 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
                             .iter()
                             .any(|t| t.len() >= 5 && edit_distance(t, &phrase_norm) <= 1)
             })
-            .map(|f| (0, f))
+            .map(|f| (0, 4, f))
             .collect();
     }
-    let best = scored.iter().map(|(s, _)| *s).max().unwrap_or(0);
-    scored.retain(|(s, _)| *s == best);
-    scored.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.1.path.cmp(&b.1.path)));
-    scored.into_iter().map(|(_, f)| f).collect()
+    let best = scored.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+    scored.retain(|(s, _, _)| *s == best);
+    scored.sort_by(|a, b| b.2.bytes.cmp(&a.2.bytes).then(a.2.path.cmp(&b.2.path)));
+    let tier = scored.first().map(|(_, t, _)| *t).unwrap_or(0);
+    (scored.into_iter().map(|(_, _, f)| f).collect(), tier)
 }
 /// Edit distance counting a swap of two neighbouring letters as one slip (“corssover” ↔ “crossover”).
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -1459,14 +1478,16 @@ fn trash_files(ctx: &Ctx, c: &Criteria) -> Investigation {
     r
 }
 
+/// The names after a delete verb: comma-separated chunks that may still contain “and” (“life and hell”),
+/// plus an optional parent (“… from Downloads”).
 fn phrases_for_folders(words: &[String]) -> (Vec<Vec<String>>, Option<Vec<String>>) {
-    // "<target> from|in|inside <parent>"
-    let mut target: Vec<String> = Vec::new();
+    let mut chunk: Vec<String> = Vec::new();
     let mut parent: Option<Vec<String>> = None;
     let mut in_parent = false;
-    let mut phrases = Vec::new();
+    let mut chunks = Vec::new();
     for w in words {
-        if matches!(w.as_str(), "from" | "in" | "inside" | "within" | "under") && !target.is_empty()
+        if matches!(w.as_str(), "from" | "in" | "inside" | "within" | "under")
+            && chunk.iter().any(|c| !FILLER.contains(&c.as_str()))
         {
             in_parent = true;
             parent = Some(Vec::new());
@@ -1478,20 +1499,174 @@ fn phrases_for_folders(words: &[String]) -> (Vec<Vec<String>>, Option<Vec<String
             }
             continue;
         }
-        if matches!(w.as_str(), "and" | "&" | "plus" | ",") {
-            if !target.is_empty() {
-                phrases.push(std::mem::take(&mut target));
+        if matches!(w.as_str(), "," | "plus") {
+            if !chunk.is_empty() {
+                chunks.push(std::mem::take(&mut chunk));
             }
             continue;
         }
-        if !FILLER.contains(&w.as_str()) {
-            target.push(w.clone());
+        if w == "&" {
+            chunk.push("and".into());
+            continue;
+        }
+        chunk.push(w.clone());
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    (chunks, parent)
+}
+/// Files whose name (without the extension) is what the phrase says, with how good the match is.
+fn match_files<'a>(ctx: &'a Ctx, phrase: &[String]) -> (Vec<&'a FileCandidate>, i32) {
+    let whole: Option<String> = phrase
+        .iter()
+        .any(|w| matches!(w.as_str(), "and" | "&"))
+        .then(|| phrase.iter().map(|w| alnum(w)).collect());
+    let words: Vec<&String> = phrase
+        .iter()
+        .filter(|w| !FILLER.contains(&w.as_str()))
+        .collect();
+    let norm: String = words.iter().map(|w| alnum(w)).collect();
+    if norm.len() < 4 {
+        return (vec![], 0);
+    }
+    let mut hits: Vec<(i32, &FileCandidate)> = vec![];
+    for f in ctx.files {
+        if in_build_output(&f.relative_path) {
+            continue;
+        }
+        let Some(stem) = f.relative_path.file_stem().map(|n| n.to_string_lossy()) else {
+            continue;
+        };
+        let stem_norm = alnum(&stem);
+        let tokens: Vec<String> = stem
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase())
+            .collect();
+        let tier = if stem_norm == norm || whole.as_deref() == Some(stem_norm.as_str()) {
+            10
+        } else if norm.len() >= 5 && stem_norm.starts_with(&norm)
+            || whole
+                .as_deref()
+                .is_some_and(|w| w.len() >= 6 && stem_norm.contains(w))
+        {
+            8
+        } else if norm.len() >= 6
+            && tokens
+                .first()
+                .is_some_and(|t| t.len() >= 5 && edit_distance(t, &norm) <= 1)
+        {
+            5
+        } else {
+            continue;
+        };
+        hits.push((tier, f));
+    }
+    let best = hits.iter().map(|(t, _)| *t).max().unwrap_or(0);
+    hits.retain(|(t, _)| *t == best);
+    hits.sort_by_key(|(_, f)| {
+        (
+            f.relative_path.components().count(),
+            std::cmp::Reverse(f.size),
+        )
+    });
+    (hits.into_iter().map(|(_, f)| f).collect(), best)
+}
+/// What one spoken name refers to: a folder (or several of the same name) or a few files.
+enum Named<'a> {
+    Folders(Vec<&'a Folder>, i32),
+    Files(Vec<&'a FileCandidate>, i32),
+    Nothing,
+}
+fn named<'a>(ctx: &'a Ctx, phrase: &[String], folders: &'a [Folder]) -> Named<'a> {
+    let (found, ft) = resolve_q(phrase, folders);
+    let (files, xt) = match_files(ctx, phrase);
+    // A file is only trusted when the name is specific: a few files at most, a real name match.
+    let file_ok = xt >= 5 && !files.is_empty() && files.len() <= 3;
+    if file_ok && xt > ft {
+        Named::Files(files, xt)
+    } else if !found.is_empty() {
+        Named::Folders(found, ft)
+    } else if file_ok {
+        Named::Files(files, xt)
+    } else {
+        Named::Nothing
+    }
+}
+fn named_score(n: &Named) -> i32 {
+    match n {
+        Named::Folders(_, t) | Named::Files(_, t) => *t,
+        Named::Nothing => -5,
+    }
+}
+/// Splits a chunk like “beer and plunder and pokemon games” into names. “and” may separate two things or sit
+/// inside one name (“life and hell”), so every split is tried and the one where the most names resolve wins.
+fn best_split(ctx: &Ctx, chunk: &[String], folders: &[Folder]) -> Vec<Vec<String>> {
+    let strip = |w: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = w.to_vec();
+        while v.first().is_some_and(|x| FILLER.contains(&x.as_str())) {
+            v.remove(0);
+        }
+        while v.last().is_some_and(|x| FILLER.contains(&x.as_str())) {
+            v.pop();
+        }
+        v
+    };
+    let soft: Vec<usize> = chunk
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.as_str() == "and")
+        .map(|(i, _)| i)
+        .collect();
+    let make = |mask: u32| -> Vec<Vec<String>> {
+        let mut out = vec![];
+        let mut cur: Vec<String> = vec![];
+        let mut k = 0;
+        for (i, w) in chunk.iter().enumerate() {
+            if soft.get(k) == Some(&i) {
+                let split = soft.len() > 12 || mask & (1 << k) != 0;
+                k += 1;
+                if split {
+                    let p = strip(&cur);
+                    if !p.is_empty() {
+                        out.push(p);
+                    }
+                    cur.clear();
+                    continue;
+                }
+            }
+            cur.push(w.clone());
+        }
+        let p = strip(&cur);
+        if !p.is_empty() {
+            out.push(p);
+        }
+        out
+    };
+    if soft.is_empty() || soft.len() > 12 {
+        return make(u32::MAX);
+    }
+    let mut best: Option<(i32, i32, Vec<Vec<String>>)> = None;
+    for mask in 0..(1u32 << soft.len()) {
+        let parts = make(mask);
+        if parts.is_empty() {
+            continue;
+        }
+        // Weight each name by the letters it explains, so “life and hell” beats “life” + “hell”.
+        let score: i32 = parts
+            .iter()
+            .map(|p| {
+                let letters: i32 = p.iter().map(|w| alnum(w).len() as i32).sum();
+                named_score(&named(ctx, p, folders)) * letters
+            })
+            .sum();
+        let key = (score, parts.len() as i32);
+        if best.as_ref().is_none_or(|(s, n, _)| key > (*s, *n)) {
+            best = Some((key.0, key.1, parts));
         }
     }
-    if !target.is_empty() {
-        phrases.push(target);
-    }
-    (phrases, parent)
+    best.map(|(_, _, p)| p).unwrap_or_default()
 }
 fn trash_folders(
     ctx: &Ctx,
@@ -1499,39 +1674,61 @@ fn trash_folders(
     folders: &[Folder],
     verb_at: usize,
 ) -> Option<Investigation> {
-    let (phrases, parent) = phrases_for_folders(&words[verb_at + 1..]);
+    let (chunks, parent) = phrases_for_folders(&words[verb_at + 1..]);
+    let phrases: Vec<Vec<String>> = chunks
+        .iter()
+        .flat_map(|c| best_split(ctx, c, folders))
+        .collect();
     if phrases.is_empty() {
         return None;
     }
     let parent_filter: Option<Vec<&Folder>> = parent.as_ref().map(|p| resolve(p, folders));
     let mut chosen: Vec<&Folder> = Vec::new();
+    let mut chosen_files: Vec<&FileCandidate> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    let label = |p: &[String]| {
+        p.iter()
+            .filter(|w| w.as_str() != "and" || p.len() > 2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     for phrase in &phrases {
-        let mut found = resolve(phrase, folders);
-        if let Some(parents) = &parent_filter
-            && !parents.is_empty()
-        {
-            // A vague parent hint only narrows the choice; it never removes every candidate.
-            let narrowed: Vec<&Folder> = found
-                .iter()
-                .copied()
-                .filter(|f| {
-                    parents
-                        .iter()
-                        .any(|p| f.path.starts_with(&p.path) && f.path != p.path)
-                })
-                .collect();
-            if !narrowed.is_empty() {
-                found = narrowed;
-            }
-        }
         let wants_all = words
             .iter()
             .any(|w| matches!(w.as_str(), "all" | "every" | "each"));
-        match found.split_first() {
-            None => missing.push(phrase.join(" ")),
-            Some((best, rest)) => {
+        match named(ctx, phrase, folders) {
+            Named::Nothing => missing.push(label(phrase)),
+            Named::Files(files, _) => {
+                for f in files {
+                    if !chosen_files.iter().any(|c| c.id == f.id) {
+                        chosen_files.push(f);
+                    }
+                }
+            }
+            Named::Folders(mut found, tier) => {
+                if let Some(parents) = &parent_filter
+                    && !parents.is_empty()
+                {
+                    // A vague parent hint only narrows the choice; it never removes every candidate.
+                    let narrowed: Vec<&Folder> = found
+                        .iter()
+                        .copied()
+                        .filter(|f| {
+                            parents
+                                .iter()
+                                .any(|p| f.path.starts_with(&p.path) && f.path != p.path)
+                        })
+                        .collect();
+                    if !narrowed.is_empty() {
+                        found = narrowed;
+                    }
+                }
+                let Some((best, rest)) = found.split_first() else {
+                    missing.push(label(phrase));
+                    continue;
+                };
                 if wants_all
                     && !rest.is_empty()
                     && rest.iter().all(|f| f.name_norm == best.name_norm)
@@ -1539,10 +1736,17 @@ fn trash_folders(
                     chosen.extend(found.iter().copied().take(FOLDER_BATCH));
                 } else {
                     chosen.push(best);
+                    if tier < 5 {
+                        notes.push(format!(
+                            "“{}” is only a loose match for {} — uncheck it if that isn’t what you meant.",
+                            label(phrase),
+                            best.path.display()
+                        ));
+                    }
                     if !rest.is_empty() {
                         notes.push(format!(
                             "“{}” also matches {}; I picked the largest ({}).",
-                            phrase.join(" "),
+                            label(phrase),
                             rest.iter()
                                 .take(3)
                                 .map(|f| f.path.display().to_string())
@@ -1555,7 +1759,7 @@ fn trash_folders(
             }
         }
     }
-    if chosen.is_empty() {
+    if chosen.is_empty() && chosen_files.is_empty() {
         return None;
     }
     let chosen = outermost(chosen);
@@ -1565,8 +1769,9 @@ fn trash_folders(
         .filter(|f| seen.insert(f.path.clone()))
         .collect();
     let targets: Vec<FolderTarget> = chosen.iter().map(|f| target(f)).collect();
-    let total: u64 = targets.iter().map(|t| t.bytes).sum();
-    let files: usize = targets.iter().map(|t| t.files).sum();
+    let total: u64 = targets.iter().map(|t| t.bytes).sum::<u64>()
+        + chosen_files.iter().map(|f| f.size).sum::<u64>();
+    let files: usize = targets.iter().map(|t| t.files).sum::<usize>() + chosen_files.len();
     let mut r = reply(
         ctx,
         "trash_named_files",
@@ -1575,19 +1780,29 @@ fn trash_folders(
             "Move {} to Trash",
             targets
                 .iter()
-                .map(|t| t.path.as_str())
+                .map(|t| t.path.clone())
+                .chain(
+                    chosen_files
+                        .iter()
+                        .map(|f| f.relative_path.display().to_string())
+                )
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
         String::new(),
     );
+    let what = match (targets.len(), chosen_files.len()) {
+        (1, 0) => format!("“{}”", targets[0].path),
+        (n, 0) => plural(n, "folder", "folders"),
+        (0, n) => plural(n, "file", "files"),
+        (a, b) => format!(
+            "{} and {}",
+            plural(a, "folder", "folders"),
+            plural(b, "file", "files")
+        ),
+    };
     r.proposal.rationale = format!(
-        "{} — {} in {} ready for the Trash. The whole folder moves as one action and stays recoverable from Finder’s Trash (Put Back). Nothing happens until you approve.{}{}",
-        if targets.len() == 1 {
-            format!("“{}”", targets[0].path)
-        } else {
-            plural(targets.len(), "folder", "folders")
-        },
+        "{what} — {} in {} ready for the Trash. Each moves whole and stays recoverable from Finder’s Trash (Put Back). Nothing happens until you approve.{}{}",
         bytes(total),
         plural(files, "file", "files"),
         if notes.is_empty() {
@@ -1598,9 +1813,21 @@ fn trash_folders(
         if missing.is_empty() {
             String::new()
         } else {
-            format!(" I couldn’t find a folder called {}.", missing.join(", "))
+            format!(" I couldn’t find anything called {}.", missing.join(", "))
         },
     );
+    r.proposal.actions = chosen_files
+        .iter()
+        .map(|f| ProposedAction::Trash { source: f.id })
+        .collect();
+    r.sources = chosen_files
+        .iter()
+        .map(|f| Source {
+            id: f.id.0,
+            path: f.relative_path.to_string_lossy().into(),
+            size: f.size,
+        })
+        .collect();
     r.folders = targets;
     Some(r)
 }
@@ -2196,6 +2423,99 @@ mod tests {
         );
         assert_eq!(r.proposal.actions.len(), 1, "{}", r.proposal.rationale);
         assert!(!trashed.iter().any(|p| p.contains("clocktower")));
+    }
+    fn real_world_fixture() -> Vec<FileCandidate> {
+        vec![
+            f(1, "Downloads/crossover-26.2.0.zip", 90_000, 0),
+            f(2, "Downloads/beer-and-plunder-mac-universal.zip", 40_000, 0),
+            f(
+                3,
+                "Coding Projects/liveandhell-template-1.21.11/src/a.java",
+                500,
+                0,
+            ),
+            f(
+                4,
+                "Coding Projects/lifeandhellcards-1.21.11/src/b.java",
+                300,
+                0,
+            ),
+            f(
+                5,
+                "Coding Projects/between-life-hell-website/index.html",
+                200,
+                0,
+            ),
+            f(6, "Coding Projects/Docker_code/Hello World/main.py", 100, 0),
+            f(7, "Games/Project Pokemon/rom.nds", 9_000, 0),
+            f(8, "Videos/fin retour bateau.mp4", 5_000, 0),
+            f(
+                9,
+                "Coding Projects/GameLegacy/node_modules/lucide-react/dist/esm/icons/beer-off.mjs",
+                5,
+                0,
+            ),
+            f(10, "Downloads/beer.png", 50, 0),
+        ]
+    }
+    #[test]
+    fn a_list_with_and_inside_names_resolves_each_name_to_a_folder_or_a_file() {
+        let q = "delete corssover, life and hell, beer and plunder and pokemon games. Then rename fin retour bateau.mp4 to BSLFILMBateau.mp4";
+        let r = respond(q, &real_world_fixture(), "Home", 9_000_000_100).expect("handled");
+        let folders: Vec<&str> = r.folders.iter().map(|f| f.path.as_str()).collect();
+        println!("{folders:?}\n{}", r.proposal.rationale);
+        // Files: the two zips are trashed, the .mp4 is renamed.
+        let trashed: Vec<u64> = r
+            .proposal
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                ProposedAction::Trash { source } => Some(source.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            trashed.contains(&1) && trashed.contains(&2),
+            "{trashed:?}\n{}",
+            r.proposal.rationale
+        );
+        assert!(
+            !trashed.contains(&10) && !trashed.contains(&9),
+            "{trashed:?}"
+        );
+        assert!(r.proposal.actions.iter().any(|a| matches!(a, ProposedAction::Rename { source, new_name } if source.0 == 8 && new_name == "BSLFILMBateau.mp4")));
+        // Folders: “life and hell” is the folder that says so, never “Hello World”.
+        assert!(
+            folders
+                .iter()
+                .any(|p| p.ends_with("lifeandhellcards-1.21.11")),
+            "{folders:?}"
+        );
+        assert!(
+            !folders.iter().any(|p| p.contains("Hello World")),
+            "{folders:?}"
+        );
+        assert!(
+            !r.proposal.rationale.contains("couldn’t find"),
+            "{}",
+            r.proposal.rationale
+        );
+    }
+    #[test]
+    fn any_number_of_tasks_in_one_message_are_all_planned() {
+        let q = "delete old.log. rename setup.dmg to Installer and move it into Archive. create a folder called Logs and move photo.png into it. Then delete new.log";
+        let r = respond(q, &fixture(), "Documents", 9_000_000_100).expect("handled");
+        println!("{}", r.proposal.rationale);
+        assert_eq!(r.proposal.actions.len(), 4, "{}", r.proposal.rationale);
+        assert!(
+            r.proposal.rationale.starts_with("4 tasks"),
+            "{}",
+            r.proposal.rationale
+        );
+        assert!(!r.proposal.rationale.contains("Not included"));
+        let q5 = "delete old.log and rename setup.dmg to Installer and delete new.log and move photo.png into Keep";
+        let r = respond(q5, &fixture(), "Documents", 9_000_000_100).expect("handled");
+        assert_eq!(r.proposal.actions.len(), 4, "{}", r.proposal.rationale);
     }
     #[test]
     fn a_file_name_with_an_extension_never_matches_a_folder() {
@@ -3166,27 +3486,90 @@ fn split_tasks(text: &str) -> Vec<String> {
         }
         i += 1;
     }
-    tasks
-        .into_iter()
-        .map(|t| {
-            t.join(" ")
-                .trim_matches(|c: char| matches!(c, ',' | ';' | '.' | '!' | ' '))
-                .to_string()
-        })
-        .filter(|t| t.split_whitespace().count() >= 2)
-        .collect()
+    // “delete A and rename B to C”: “and” followed by a new verb starts another task.
+    const VERBS: &[&str] = &[
+        "delete",
+        "remove",
+        "trash",
+        "erase",
+        "discard",
+        "wipe",
+        "rename",
+        "move",
+        "put",
+        "send",
+        "create",
+        "make",
+        "organize",
+        "organise",
+        "sort",
+        "copy",
+        "duplicate",
+        "find",
+        "list",
+        "show",
+        "clean",
+        "clear",
+    ];
+    let mut pieces: Vec<Vec<&str>> = vec![];
+    for t in tasks {
+        let mut cur: Vec<&str> = vec![];
+        for (k, w) in t.iter().enumerate() {
+            let next_is_verb = t.get(k + 1).is_some_and(|n| {
+                VERBS.contains(
+                    &n.to_lowercase()
+                        .trim_matches(|c: char| !c.is_alphanumeric()),
+                )
+            });
+            if w.eq_ignore_ascii_case("and") && next_is_verb && !cur.is_empty() {
+                pieces.push(std::mem::take(&mut cur));
+                continue;
+            }
+            cur.push(w);
+        }
+        pieces.push(cur);
+    }
+    let clean = |t: &[&str]| {
+        t.join(" ")
+            .trim_matches(|c: char| matches!(c, ',' | ';' | '.' | '!' | ' '))
+            .to_string()
+    };
+    let mut out: Vec<String> = vec![];
+    for piece in pieces {
+        let text = clean(&piece);
+        if text.split_whitespace().count() < 2 {
+            continue;
+        }
+        let lower: Vec<String> = text
+            .split_whitespace()
+            .map(|w| {
+                w.to_lowercase()
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_string()
+            })
+            .collect();
+        // “… move it into Z” / “… into it” refer back to the previous task: they are one job.
+        let refers_back = lower
+            .get(1)
+            .is_some_and(|w| matches!(w.as_str(), "it" | "them" | "that" | "those" | "these"))
+            || lower
+                .last()
+                .is_some_and(|w| matches!(w.as_str(), "it" | "there" | "them"));
+        match out.last_mut() {
+            Some(prev) if refers_back => {
+                prev.push_str(" and ");
+                prev.push_str(&text);
+            }
+            _ => out.push(text),
+        }
+    }
+    out
 }
 /// Several tasks in one message (“delete A and B. Then rename C to D”): each task is understood on its
 /// own and they are merged into ONE reviewable plan. A task that can’t be understood is named, never dropped.
 fn multi_task(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation> {
     let tasks = split_tasks(text);
     if tasks.len() < 2 {
-        return None;
-    }
-    // “rename X to Y, then move it into Z” is one two-step job, handled as a single plan.
-    let raw = raw_tokens(text);
-    let words = tokens(text);
-    if multi_step(ctx, &raw, &words, folders).is_some_and(|r| !r.proposal.actions.is_empty()) {
         return None;
     }
     let mut merged: Option<Investigation> = None;

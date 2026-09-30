@@ -1,6 +1,8 @@
 # Changelog
 
 ## 1.0.0 — first stable release
+- **Name lists resolve properly:** in “delete A, life and hell, beer and plunder and B”, “and” may separate items or sit inside a name, so Tidy tries every split and keeps the one where the most names resolve; each name can be a folder **or a file** (`beer-and-plunder-mac-universal.zip`), weak guesses are flagged for review, and names Tidy can't find are listed.
+- **Unlimited tasks per message:** split on sentences, “then”, “after that” and “and” + a new verb (“delete A and rename B to C and move D into E”); “rename X to Y and move **it** into Z” still stays one two-step job.
 - **Several tasks in one message:** “delete A, B and C. Then rename movie.mp4 to Film.mp4” becomes one plan listing every task; a task Tidy can't understand is named instead of silently dropped. Trash steps are approved first, then the remaining steps follow in the chat. Names with an extension (`movie.mp4`) are always treated as files and never fuzzy-matched to a folder, and a single typo in a folder name (“corssover” → Crossover) is forgiven when nothing else matches.
 - **Multi-step requests:** “rename X to Y and move it into Z” (or “move X into Z and rename it to Y”) and “create a folder Z and move X into it” now work as one reviewed plan with a single approval, for files and whole folders. Nothing is overwritten, and Put back restores the original name and place in one step. A folder named explicitly (“the Old Stuff folder”) is no longer mistaken for an age filter when moving.
 - **Read-only folders can be trashed or moved:** Tidy makes the approved folder writable just for the move and restores its permissions (also on Put back); partial failures say what already ran and drop finished items from the plan.

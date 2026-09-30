@@ -273,10 +273,51 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
             })
             .collect();
     }
+    if scored.is_empty() && phrase_norm.len() >= 5 {
+        // Last resort, for a typo (“corssover” → Crossover): one slip in a long-enough name.
+        let limit = if phrase_norm.len() >= 9 { 2 } else { 1 };
+        scored = folders
+            .iter()
+            .filter(|f| {
+                edit_distance(&f.name_norm, &phrase_norm) <= limit
+                    || phrase.len() == 1
+                        && f.name_tokens
+                            .iter()
+                            .any(|t| t.len() >= 5 && edit_distance(t, &phrase_norm) <= 1)
+            })
+            .map(|f| (0, f))
+            .collect();
+    }
     let best = scored.iter().map(|(s, _)| *s).max().unwrap_or(0);
     scored.retain(|(s, _)| *s == best);
     scored.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.1.path.cmp(&b.1.path)));
     scored.into_iter().map(|(_, f)| f).collect()
+}
+/// Edit distance counting a swap of two neighbouring letters as one slip (“corssover” ↔ “crossover”).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > 2 {
+        return 3;
+    }
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
 }
 fn in_build_output(path: &Path) -> bool {
     path.components().any(|c| {
@@ -2141,6 +2182,20 @@ mod tests {
             "{}",
             r.proposal.rationale
         );
+    }
+    #[test]
+    fn the_exact_sentence_with_a_typo_still_becomes_one_plan() {
+        let q = "delete corssover, life and hell, beer and plunder and pokemon games. Then rename fin retour bateau.mp4 to BSLFILMBateau.mp4";
+        let r = respond(q, &games_fixture(), "Documents", 9_000_000_100).expect("handled");
+        let trashed: Vec<&str> = r.folders.iter().map(|f| f.path.as_str()).collect();
+        println!("{trashed:?}\n{}", r.proposal.rationale);
+        assert!(
+            trashed.iter().any(|p| p.ends_with("Crossover")),
+            "{trashed:?}\n{}",
+            r.proposal.rationale
+        );
+        assert_eq!(r.proposal.actions.len(), 1, "{}", r.proposal.rationale);
+        assert!(!trashed.iter().any(|p| p.contains("clocktower")));
     }
     #[test]
     fn a_file_name_with_an_extension_never_matches_a_folder() {

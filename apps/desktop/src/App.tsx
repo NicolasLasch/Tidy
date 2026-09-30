@@ -1,8 +1,7 @@
 import LocalAi from "./LocalAi";
-import StorageAnalyzer from "./StorageAnalyzer";
 import HistoryJournal from "./HistoryJournal";
 import ChatView, { size } from "./ChatView";
-import FoldersView from "./FoldersView";
+import StorageView from "./StorageView";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -10,7 +9,6 @@ import {
   Cpu,
   File,
   Folder,
-  FolderTree,
   History,
   LoaderCircle,
   MessageCircle,
@@ -47,7 +45,7 @@ type Job = {
   visited: number;
   message: string;
 };
-type Tab = "chat" | "folders" | "cleanup" | "files" | "history" | "ai";
+type Tab = "chat" | "storage" | "files" | "history" | "ai";
 const emptyJob: Job = { running: false, scope_id: null, visited: 0, message: "" };
 const basename = (path: string) =>
   path.split(/[\\/]/).filter(Boolean).at(-1) || path;
@@ -62,6 +60,7 @@ export default function App() {
   const [job, setJob] = useState<Job>(emptyJob);
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
+  const [prompt, setPrompt] = useState<string | null>(null);
   const lastRunning = useRef(false);
 
   async function refresh() {
@@ -136,7 +135,7 @@ export default function App() {
       if (id !== null) {
         await refresh();
         setBaseId(id);
-        setTab("folders");
+        setTab("storage");
         await scan(id);
       }
     } catch (e) {
@@ -170,8 +169,7 @@ export default function App() {
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "chat", label: "Chat", icon: <MessageCircle size={22} /> },
-    { id: "folders", label: "Folders", icon: <FolderTree size={22} /> },
-    { id: "cleanup", label: "Cleanup", icon: <HardDrive size={22} /> },
+    { id: "storage", label: "Storage", icon: <HardDrive size={22} /> },
     { id: "files", label: "Files", icon: <File size={22} /> },
     { id: "history", label: "History", icon: <History size={22} /> },
     { id: "ai", label: "AI", icon: <Cpu size={22} /> },
@@ -236,18 +234,20 @@ export default function App() {
             scopes={chatScopes}
             scopeId={chatId}
             scanning={scanningNow}
+            prompt={prompt}
+            onPromptSent={() => setPrompt(null)}
             compact={compact}
             onRefresh={() => setRevision((r) => r + 1)}
             onOpenFolders={() => {
               if (compact) void setCompactMode(false);
-              setTab("folders");
+              setTab("storage");
             }}
             onScan={() => chatId !== null && void scan(chatId).catch((e) => setError(String(e)))}
           />
         </div>
-        {tab === "folders" && (
-          <FoldersView
-            bases={scopes.map((s) => ({
+        {tab === "storage" && (
+          <StorageView
+            scopes={scopes.map((s) => ({
               id: s.id,
               path: s.path,
               name: basename(s.path),
@@ -261,6 +261,15 @@ export default function App() {
             onToggleBase={(id, on) => void toggleBase(id, on)}
             onToggleFolder={toggleFolder}
             onAdd={() => void add()}
+            onAsk={(text, id) => {
+              if (!selected.has(id)) {
+                setError("Switch this folder on first so Tidy is allowed to work in it.");
+                return;
+              }
+              setChatId(id);
+              setPrompt(text);
+              setTab("chat");
+            }}
             scanning={scanningNow}
             refreshKey={revision}
             onChanged={() => {
@@ -268,22 +277,6 @@ export default function App() {
               void refresh();
             }}
           />
-        )}
-        {tab === "cleanup" && (
-          <div className="x-page legacy">
-            {base ? (
-              <StorageAnalyzer
-                key={`storage-${baseId}-${revision}`}
-                scopeId={base.id}
-                scopeName={basename(base.path)}
-                snapshot={base.scanned_at}
-                scanning={scanningNow}
-                onRefreshNeeded={() => setRevision((r) => r + 1)}
-              />
-            ) : (
-              <p className="x-note">Add a folder in Folders first.</p>
-            )}
-          </div>
         )}
         {tab === "files" && (
           <FilesView

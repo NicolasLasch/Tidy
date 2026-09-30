@@ -73,6 +73,8 @@ export default function ChatView({
   scopes,
   scopeId,
   scanning,
+  prompt,
+  onPromptSent,
   compact,
   onRefresh,
   onOpenFolders,
@@ -81,6 +83,8 @@ export default function ChatView({
   scopes: ChatScope[];
   scopeId: number | null;
   scanning: boolean;
+  prompt: string | null;
+  onPromptSent: () => void;
   compact: boolean;
   onRefresh: () => void;
   onOpenFolders: () => void;
@@ -110,6 +114,12 @@ export default function ChatView({
     setError("");
     setLastTx(null);
   }, [scopeId]);
+  useEffect(() => {
+    if (prompt && scopeId !== null && !busy && !scanning) {
+      onPromptSent();
+      void send(prompt);
+    }
+  }, [prompt, scopeId]);
   useEffect(() => {
     end.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [messages.length, busy, approval]);
@@ -294,11 +304,11 @@ export default function ChatView({
         </div>
         <h2>Choose what Tidy can see</h2>
         <p>
-          Tidy only works inside folders you switch on. Open Folders, see what
+          Tidy only works inside folders you switch on. Open Storage, see what
           weighs the most, and turn on the ones you want help with.
         </p>
         <button className="x-primary" onClick={onOpenFolders}>
-          Open Folders
+          Open Storage
         </button>
       </div>
     );

@@ -1879,6 +1879,26 @@ mod tests {
             .is_none()
         );
     }
+    #[test]
+    fn project_listing_uses_markers_including_git() {
+        let dir = std::env::temp_dir().join(format!("tidy_projects_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Alpha/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("Beta")).unwrap();
+        std::fs::write(dir.join("Beta/Cargo.toml"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("Notes")).unwrap();
+        assert!(wants_projects("List me all the projects I have"));
+        assert!(!wants_projects("delete the projects folder"));
+        let r = list_projects(&dir, "Coding", &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            r.proposal.rationale.contains("2 projects"),
+            "{}",
+            r.proposal.rationale
+        );
+        assert!(r.proposal.rationale.contains("Alpha") && r.proposal.rationale.contains("Rust"));
+        assert!(!r.proposal.rationale.contains("Notes"));
+    }
 }
 
 /// True for "list/show my projects" style requests.

@@ -1,15 +1,12 @@
 /* Tidy 0.8.2 — iOS-style shell. Loaded after styles.css; legacy pages render inside .legacy. */
 :root {
-  --bg: #f2f2f7; --card: #ffffff; --card2: #f7f7fa; --line: rgba(60, 60, 67, 0.16);
-  --text: #1c1c1e; --muted: #8a8a90; --blue: #0a84ff; --red: #ff3b30; --green: #30d158;
-  --bubble-in: #e9e9ee; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px rgba(0,0,0,.06);
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #000; --card: #1c1c1e; --card2: #2c2c2e; --line: rgba(255,255,255,.14); --text: #f2f2f7; --muted: #98989f; --bubble-in: #2c2c2e; --shadow: none; }
+  --bg: transparent; --card: rgba(38, 40, 52, 0.42); --card2: rgba(255, 255, 255, 0.07); --line: rgba(255, 255, 255, 0.09);
+  --text: #f4f4f8; --muted: #a0a3b1; --blue: #0a84ff; --red: #ff453a; --green: #30d158;
+  --bubble-in: rgba(255, 255, 255, 0.1); --shadow: 0 1px 0 rgba(255,255,255,.05) inset, 0 10px 30px rgba(0,0,0,.25);
+  color-scheme: dark;
 }
 html, body, #root { height: 100%; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system, "SF Pro Text", BlinkMacSystemFont, Inter, sans-serif; font-size: 14px; overflow: hidden; }
+body { background: transparent !important; color: var(--text); font-family: -apple-system, "SF Pro Text", BlinkMacSystemFont, Inter, sans-serif; font-size: 14px; overflow: hidden; }
 .x-app { height: 100vh; display: flex; flex-direction: column; background: var(--bg); color: var(--text); }
 .x-app button, .x-app input, .x-app select, .x-app textarea { font-family: inherit; color: inherit; }
 .x-spin { animation: xspin 1s linear infinite; } @keyframes xspin { to { transform: rotate(360deg); } }
@@ -116,3 +113,41 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, "S
 .x-page.legacy { background: #f8f9f6; color: #23352f; border-radius: 18px; margin: 4px auto 24px; padding: 20px; color-scheme: light; }
 .x-page.legacy h1, .x-page.legacy h2, .x-page.legacy h3, .x-page.legacy h4 { color: #15223e; }
 @media (max-width: 760px) { .x-version { display: none; } .x-tabbar button { padding: 4px 10px; } }
+
+/* Glass: translucent surfaces over the macOS vibrancy window, with low grain */
+.x-app { background: linear-gradient(160deg, rgba(58, 64, 110, .32), rgba(12, 14, 22, .42) 60%, rgba(30, 20, 50, .3)); }
+body::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 999; opacity: .07; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .9 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+.x-group, .x-card, .x-composer, .x-actionbar, .x-round, .x-scope-pick, .x-segment button, .x-chips button, .x-undo, .x-tip, .x-search, .x-bubble.assistant, .x-tabbar {
+  -webkit-backdrop-filter: blur(26px) saturate(1.5); backdrop-filter: blur(26px) saturate(1.5); border: 1px solid var(--line); }
+.x-tabbar { background: rgba(20, 22, 32, .35); border-width: 1px 0 0; }
+.x-composer { background: rgba(30, 32, 44, .5); }
+.x-sheet { background: rgba(34, 36, 50, .82); -webkit-backdrop-filter: blur(40px) saturate(1.6); backdrop-filter: blur(40px) saturate(1.6); border: 1px solid var(--line); }
+.x-sheet-backdrop { background: rgba(0, 0, 0, .45); }
+.x-search { background: rgba(255,255,255,.08); }
+.x-switch { background: rgba(255,255,255,.2); }
+.x-page.legacy { background: #f4f4f4; filter: invert(.9) hue-rotate(180deg); border: 0; }
+.x-page.legacy h1, .x-page.legacy h2, .x-page.legacy h3, .x-page.legacy h4 { color: #15223e; }
+/* storage */
+.x-disk { display: flex; gap: 14px; align-items: center; padding: 14px 16px; }
+.x-disk > div { flex: 1; display: flex; flex-direction: column; gap: 6px; } .x-disk b span { color: var(--muted); font-weight: 500; } .x-disk small { color: var(--muted); }
+.x-disk i { display: block; height: 8px; border-radius: 8px; background: rgba(255,255,255,.12); overflow: hidden; } .x-disk u { display: block; height: 100%; background: linear-gradient(90deg, #30d158, #0a84ff); }
+.x-section { display: flex; align-items: center; gap: 6px; margin: 16px 4px 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+.x-app .x-section { color: var(--muted); }
+.x-tips { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+.x-tip { text-align: left; border-radius: 16px; padding: 12px; background: var(--card); color: var(--text); display: flex; flex-direction: column; gap: 4px; cursor: pointer; box-shadow: var(--shadow); }
+.x-tip:disabled { cursor: default; } .x-tip span { font-size: 20px; } .x-tip small { color: var(--muted); line-height: 1.35; } .x-tip em { font-style: normal; color: var(--blue); font-weight: 600; font-size: 12px; display: flex; align-items: center; gap: 2px; margin-top: 2px; }
+.x-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 14px 0 4px; color: var(--muted); }
+.x-crumbs button { border: 0; background: none; color: var(--blue); font-weight: 600; cursor: pointer; padding: 2px 4px; } .x-crumbs span { display: inline-flex; align-items: center; }
+.x-here { color: var(--muted); margin: 6px 4px; } .x-here b { color: var(--text); }
+.x-drill { border: 0; background: none; text-align: left; cursor: pointer; padding: 0; } .x-drill b { display: flex; align-items: center; gap: 6px; }
+.x-chev { color: var(--muted); flex: none; } .x-folder-row.plain { opacity: .8; }
+.x-app .x-folder-main b, .x-app .x-drill b { color: var(--text); }
+/* Let the window's vibrancy show through: nothing opaque behind the app.
+   styles.css sets an opaque light colour on :root, which is what was hiding the desktop. */
+html, :root, body, #root { background: transparent !important; }
+.x-app { background: linear-gradient(160deg, rgba(90, 100, 160, .06), rgba(0, 0, 0, .10)); }
+:root { --card: rgba(30, 32, 44, 0.30); --bubble-in: rgba(255, 255, 255, 0.08); }
+.x-tabbar { background: rgba(10, 12, 20, .12); }
+.x-composer { background: rgba(20, 22, 32, .28); }
+.x-tip, .x-search, .x-segment button, .x-round, .x-scope-pick { background: rgba(255, 255, 255, .06); }

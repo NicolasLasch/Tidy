@@ -2,15 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowUp,
+  File as FileIcon,
   Check,
   ChevronRight,
   Folder,
-  FolderOpen,
   LoaderCircle,
   ShieldCheck,
-  Sparkles,
   Square,
-  Trash2,
   Undo2,
   X,
 } from "lucide-react";
@@ -18,14 +16,22 @@ import {
 type Action =
   | { action: "move" | "copy"; source: number; destination_relative: string }
   | { action: "trash"; source: number }
-  | { action: "permissions"; source: number; mode: number };
+  | { action: "permissions"; source: number; mode: number }
+  | { action: "rename"; source: number; new_name: string }
+  | { action: "create_folder"; path: string }
+  | { action: "move_folder"; source: string; destination_relative: string };
+const srcId = (a: Action) => ("source" in a && typeof a.source === "number" ? a.source : -1);
 type Trace = { label: string; detail: string };
-type FolderTarget = { path: string; files: number; bytes: number };
+type FolderTarget = { path: string; files: number; bytes: number; note?: string | null };
+type ListItem = { kind: "folder" | "file"; path: string; bytes: number; files: number; note?: string | null };
+type Section = { title: string; items: ListItem[] };
 type Plan = {
   engine: "model" | "local_filter" | "instant";
   proposal: { actions: Action[]; rationale: string };
   sources: { id: number; path: string; size: number }[];
   folders: FolderTarget[];
+  sections?: Section[];
+  pick?: boolean;
   trace: Trace[];
   clarification: string | null;
   indexed: number;
@@ -37,13 +43,14 @@ type Approval = {
   tx_id: number;
   actions_count: number;
   actions: {
-    type: "move" | "rename" | "trash" | "trash_dir" | "copy" | "permissions";
+    type: "move" | "rename" | "trash" | "trash_dir" | "copy" | "permissions" | "create_dir" | "move_dir";
     relative_source: string;
     relative_dest?: string;
     old_mode?: number;
     new_mode?: number;
     files?: number;
     original_size?: number;
+    read_only?: boolean;
   }[];
 };
 type Message = {
@@ -64,8 +71,10 @@ const YES =
 const NO = /^(no|nope|cancel|never ?mind|stop|don'?t|non)\b/i;
 const chips = [
   "What’s taking the most space?",
+  "List all my projects",
+  "Create a folder called Archive",
+  "Move all PDFs into Documents/PDFs",
   "Delete the 10 biggest files",
-  "Clean up node_modules and build artifacts",
   "Organize by type",
 ];
 
@@ -103,12 +112,15 @@ export default function ChatView({
     null,
   );
   const end = useRef<HTMLDivElement>(null);
+  // The last request that produced a listing, so follow-ups (“why no size?”, “measure them”) have context.
+  const lastListing = useRef<string | null>(null);
   const scope = scopes.find((s) => s.id === scopeId) ?? null;
   const lastPlan = [...messages].reverse().find((m) => m.plan)?.plan;
   const activePlan =
     messages.at(-1)?.role === "assistant" ? messages.at(-1)?.plan : undefined;
 
   useEffect(() => {
+    lastListing.current = null;
     setMessages([]);
     setApproval(null);
     setError("");
@@ -133,7 +145,8 @@ export default function ChatView({
     return () => clearInterval(timer);
   }, [busy]);
 
-  const key = (a: Action) => `f${a.source}`;
+  const key = (a: Action) =>
+    a.action === "create_folder" ? `c${a.path}` : a.action === "move_folder" ? `m${a.source}` : `f${srcId(a)}`;
   const sources = useMemo(
     () => new Map(activePlan?.sources.map((s) => [s.id, s]) ?? []),
     [activePlan],
@@ -146,7 +159,7 @@ export default function ChatView({
   );
   const pickedBytes =
     (pickedFolders?.reduce((n, f) => n + f.bytes, 0) ?? 0) +
-    (pickedActions?.reduce((n, a) => n + (sources.get(a.source)?.size ?? 0), 0) ??
+    (pickedActions?.reduce((n, a) => n + (sources.get(srcId(a))?.size ?? 0), 0) ??
       0);
   const pickedCount =
     (pickedFolders?.length ?? 0) + (pickedActions?.length ?? 0);
@@ -175,15 +188,12 @@ export default function ChatView({
       const plan = await invoke<Plan>("plan_with_agent", {
         scopeId,
         request:
-          activePlan?.clarification && lastPlan
+          (activePlan?.clarification || activePlan?.pick) && lastPlan
             ? `${messages.filter((m) => m.role === "user").at(-1)?.text ?? ""}\nUser follow-up: ${value}`
             : value,
-        conversation: next
-          .slice(-4)
-          .map(({ role, text }) => ({ role, text: text.slice(0, 2500) })),
-        workflowId: null,
-        previous: [],
+        previous: lastListing.current,
       });
+      if (plan.sections?.length || plan.folders.length) lastListing.current = value;
       setMessages([
         ...next,
         {
@@ -196,11 +206,11 @@ export default function ChatView({
           plan,
         },
       ]);
+      // Candidate lists start unchecked so nothing is chosen for removal by accident.
       setPicked(
-        new Set([
-          ...plan.folders.map((f) => `d${f.path}`),
-          ...plan.proposal.actions.map(key),
-        ]),
+        plan.pick
+          ? new Set()
+          : new Set([...plan.folders.map((f) => `d${f.path}`), ...plan.proposal.actions.map(key)]),
       );
       setLimit(12);
     } catch (e) {
@@ -221,9 +231,12 @@ export default function ChatView({
           txId: undoId,
         });
       } else if (pickedFolders?.length) {
+        // A folder inside another chosen folder moves with it; send only the outer ones.
+        const chosen = pickedFolders.map((f) => f.path);
+        const outer = chosen.filter((p) => !chosen.some((o) => o !== p && p.startsWith(o + "/")));
         view = await invoke<Approval>("request_folder_trash_approval", {
           scopeId,
-          folders: pickedFolders.map((f) => f.path),
+          folders: outer,
         });
       } else {
         view = await invoke<Approval>("request_plan_approval", {
@@ -273,7 +286,7 @@ export default function ChatView({
               ? "Restored. Everything is back where it was."
               : trashed
                 ? `Done — ${approval.actions_count} ${approval.actions_count === 1 ? "item" : "items"} moved to the Trash. You can put them back from Finder’s Trash.`
-                : `Done — ${report.actions_applied} changes applied and verified. You can undo them.`,
+                : `Done — ${report.actions_applied} changes applied and verified. Find them in History to undo.`,
         },
       ]);
       setApproval(null);
@@ -281,8 +294,39 @@ export default function ChatView({
       setPicked(new Set());
       onRefresh();
     } catch (e) {
+      const txId = approval.tx_id;
       setApproval(null);
       setError(String(e));
+      // Some steps may have run before one failed: drop those from the plan so it isn't stale.
+      try {
+        const detail = await invoke<{ steps: { source_relative: string; state: string }[] } | null>(
+          "get_transaction_detail",
+          { txId },
+        );
+        const done = new Set(detail?.steps.filter((s) => s.state === "verified").map((s) => s.source_relative));
+        if (done.size) {
+          setMessages((prev) =>
+            prev.map((m, i) => {
+              if (i !== prev.length - 1 || !m.plan) return m;
+              const byId = new Map(m.plan.sources.map((s) => [s.id, s.path]));
+              return {
+                ...m,
+                plan: {
+                  ...m.plan,
+                  folders: m.plan.folders.filter((f) => !done.has(f.path)),
+                  proposal: {
+                    ...m.plan.proposal,
+                    actions: m.plan.proposal.actions.filter((a) => !done.has(byId.get(srcId(a)) ?? "")),
+                  },
+                },
+              };
+            }),
+          );
+          setPicked((p) => new Set([...p].filter((k) => !done.has(k.slice(1)))));
+        }
+      } catch {
+        /* the error above is already shown */
+      }
       onRefresh();
     } finally {
       setWorking(false);
@@ -299,9 +343,7 @@ export default function ChatView({
   if (scopeId === null || !scope) {
     return (
       <div className="x-empty">
-        <div className="x-empty-icon">
-          <FolderOpen size={34} />
-        </div>
+        <img className="x-empty-logo" src="/logo.png" alt="" />
         <h2>Choose what Tidy can see</h2>
         <p>
           Tidy only works inside folders you switch on. Open Storage, see what
@@ -318,9 +360,7 @@ export default function ChatView({
       <div className="x-chat-scroll">
         {messages.length === 0 && !busy && (
           <div className="x-hello">
-            <div className="x-hello-mark">
-              <Sparkles size={26} />
-            </div>
+            <img className="x-empty-logo" src="/logo.png" alt="" />
             <h2>What should I do in {scope.name}?</h2>
             <p>
               Just tell me. I’ll prepare it, show you exactly what changes, and
@@ -343,6 +383,9 @@ export default function ChatView({
         {messages.map((m, i) => (
           <div key={i} className={`x-row ${m.role}`}>
             <div className={`x-bubble ${m.role}`}>{m.text}</div>
+            {m.role === "assistant" && !!m.plan?.sections?.length && (
+              <Sections sections={m.plan.sections} onOpen={(p) => void send(`what's inside ${p}`)} />
+            )}
             {m.role === "assistant" && m.plan && i === messages.length - 1 && (
               <PlanCard
                 plan={m.plan}
@@ -404,16 +447,16 @@ export default function ChatView({
         <div className="x-actionbar">
           <div>
             <b>
-              {pickedCount} selected · {size(pickedBytes)}
+              {pickedCount} selected{pickedBytes ? ` · ${size(pickedBytes)}` : ""}
             </b>
-            <small>Goes to Trash after you approve</small>
+            <small>{pickedFolders?.length || pickedActions?.some((a) => a.action === "trash") ? "Nothing changes until you approve" : "You’ll review before anything changes"}</small>
           </div>
           <button
-            className="x-danger"
+            className="x-primary"
             disabled={working || busy || scanning}
             onClick={() => void review()}
           >
-            {working ? <LoaderCircle size={15} className="x-spin" /> : <Trash2 size={15} />}
+            {working ? <LoaderCircle size={15} className="x-spin" /> : <ShieldCheck size={15} />}
             Review
           </button>
         </div>
@@ -468,7 +511,7 @@ export default function ChatView({
             <h3>
               {undoTarget !== null
                 ? "Restore these changes?"
-                : approval.actions.some((a) => a.type === "trash_dir")
+                : approval.actions.every((a) => a.type === "trash" || a.type === "trash_dir")
                   ? "Move to Trash?"
                   : "Apply these changes?"}
             </h3>
@@ -479,13 +522,20 @@ export default function ChatView({
             <div className="x-sheet-list">
               {approval.actions.slice(0, 40).map((a, i) => (
                 <div key={i}>
-                  {a.type === "trash_dir" ? <Folder size={16} /> : <ChevronRight size={16} />}
+                  {a.type === "trash_dir" || a.type === "create_dir" || a.type === "move_dir" ? <Folder size={16} /> : <ChevronRight size={16} />}
                   <span>
                     <b>{a.relative_source}</b>
+                    {a.read_only && (
+                      <small>Read-only folder — Tidy makes it writable just for the move and puts its permissions back.</small>
+                    )}
                     <small>
                       {a.type === "trash_dir"
                         ? `Whole folder · ${(a.files ?? 0).toLocaleString()} files · ${size(a.original_size ?? 0)} → Trash`
-                        : a.type === "trash"
+                        : a.type === "create_dir"
+                          ? "New folder"
+                          : a.type === "move_dir"
+                            ? `Folder → ${a.relative_dest}`
+                            : a.type === "trash"
                           ? "→ Trash"
                           : a.type === "permissions"
                             ? `Permissions ${a.old_mode?.toString(8)} → ${a.new_mode?.toString(8)}`
@@ -509,7 +559,7 @@ export default function ChatView({
                 Cancel
               </button>
               <button
-                className={undoTarget !== null ? "x-primary" : "x-danger"}
+                className={undoTarget !== null || !approval.actions.some((a) => a.type === "trash" || a.type === "trash_dir") ? "x-primary" : "x-danger"}
                 disabled={working || scanning}
                 onClick={() => void apply()}
               >
@@ -548,11 +598,11 @@ function PlanCard({
     ...plan.proposal.actions.map(keyOf),
   ];
   if (!all.length) return null;
-  const grouped = plan.proposal.actions.some((a) => a.action === "move");
+  const grouped = plan.proposal.actions.some((a) => a.action !== "trash");
   return (
     <div className="x-card">
       <div className="x-card-head">
-        <b>{grouped ? "Proposed changes" : "Ready for the Trash"}</b>
+        <b>{plan.pick ? "Tick what to move to the Trash" : grouped ? "Proposed changes" : "Ready for the Trash"}</b>
         <button
           onClick={() =>
             setPicked(picked.size === all.length ? new Set() : new Set(all))
@@ -568,37 +618,49 @@ function PlanCard({
             checked={picked.has(`d${f.path}`)}
             onChange={() => toggle(`d${f.path}`)}
           />
-          <Folder size={18} className="x-folder-icon" />
+          <Folder size={18} className="x-item-icon" />
           <span>
             <b>{f.path.split("/").at(-1)}</b>
             <small>
               {f.path.includes("/") ? f.path.split("/").slice(0, -1).join("/") + " · " : ""}
-              {f.files.toLocaleString()} files
+              {f.files.toLocaleString()} files{f.note ? ` · ${f.note}` : ""}
             </small>
           </span>
           <em>{size(f.bytes)}</em>
         </label>
       ))}
       {plan.proposal.actions.slice(0, limit).map((a) => {
-        const s = sources.get(a.source);
+        const s = sources.get(srcId(a));
+        const leaf = (p: string) => p.split("/").at(-1) ?? p;
+        const dir = (p: string) => (p.includes("/") ? p.split("/").slice(0, -1).join("/") : "top level");
+        const folderAction = a.action === "create_folder" || a.action === "move_folder";
+        const title =
+          a.action === "create_folder"
+            ? `New folder “${leaf(a.path)}”`
+            : a.action === "move_folder"
+              ? leaf(a.source)
+              : (s?.path ? leaf(s.path) : String(srcId(a)));
+        const detail =
+          a.action === "create_folder"
+            ? dir(a.path) === "top level" ? "in this folder" : `in ${dir(a.path)}`
+            : a.action === "move_folder"
+              ? `${a.source} → ${a.destination_relative}`
+              : a.action === "trash"
+                ? dir(s?.path ?? "")
+                : a.action === "permissions"
+                  ? `Permissions ${a.mode.toString(8)}`
+                  : a.action === "rename"
+                    ? `${dir(s?.path ?? "")} → renamed to ${a.new_name}`
+                    : `→ ${a.destination_relative}`;
         return (
-          <label key={a.source} className="x-item">
-            <input
-              type="checkbox"
-              checked={picked.has(keyOf(a))}
-              onChange={() => toggle(keyOf(a))}
-            />
+          <label key={keyOf(a)} className="x-item">
+            <input type="checkbox" checked={picked.has(keyOf(a))} onChange={() => toggle(keyOf(a))} />
+            {folderAction && <Folder size={18} className="x-item-icon" />}
             <span>
-              <b>{s?.path.split("/").at(-1) ?? a.source}</b>
-              <small>
-                {a.action === "trash"
-                  ? (s?.path.includes("/") ? s.path.split("/").slice(0, -1).join("/") : "top level")
-                  : a.action === "permissions"
-                    ? `Permissions ${a.mode.toString(8)}`
-                    : `→ ${a.destination_relative}`}
-              </small>
+              <b>{title}</b>
+              <small>{detail}</small>
             </span>
-            <em>{size(s?.size ?? 0)}</em>
+            <em>{s ? size(s.size) : ""}</em>
           </label>
         );
       })}
@@ -608,5 +670,53 @@ function PlanCard({
         </button>
       )}
     </div>
+  );
+}
+
+function Sections({ sections, onOpen }: { sections: Section[]; onOpen: (path: string) => void }) {
+  return (
+    <>
+      {sections.map((sec) => {
+        const max = Math.max(1, ...sec.items.map((i) => i.bytes));
+        return (
+          <div key={sec.title} className="x-card">
+            <div className="x-card-head">
+              <b>{sec.title}</b>
+              <small className="x-count">{sec.items.length}</small>
+            </div>
+            {sec.items.map((it) => {
+              const name = it.path.split("/").at(-1) ?? it.path;
+              const parent = it.path.includes("/") ? it.path.split("/").slice(0, -1).join("/") : "";
+              const inner = (
+                <>
+                  {it.kind === "folder" ? <Folder size={18} className="x-item-icon" /> : <FileIcon size={18} className="x-file-icon" />}
+                  <span>
+                    <b title={it.path}>{name}</b>
+                    <small>
+                      {[
+                        parent,
+                        it.kind === "folder" && it.files ? `${it.files.toLocaleString()} files` : it.kind === "file" ? "file" : "",
+                        it.note ?? "",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </small>
+                    {it.bytes > 0 && <i><u style={{ width: `${Math.max(1, (100 * it.bytes) / max)}%` }} /></i>}
+                  </span>
+                  <em>{it.bytes ? size(it.bytes) : ""}</em>
+                </>
+              );
+              return it.kind === "folder" ? (
+                <button key={it.path} className="x-list-row" onClick={() => onOpen(it.path)} title="Show what’s inside">
+                  {inner}
+                </button>
+              ) : (
+                <div key={it.path} className="x-list-row static">{inner}</div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </>
   );
 }

@@ -237,7 +237,8 @@ fn secure_scan_does_not_expand_links_apps_or_repositories() {
     f.file("repo/hidden", b"x");
     symlink(&f.0, f.0.join("selected/link")).unwrap();
     let result = f.scan(true);
-    assert!(result.files.is_empty());
+    // The repository's working file is indexed; its .git, the app bundle and the link are omitted.
+    assert_eq!(result.files.len(), 1);
     assert_eq!(result.omission_count, 3);
 }
 #[cfg(unix)]

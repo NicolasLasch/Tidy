@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Tidy — 20s promo</title>
+<style>
+:root{--bg:#0c0c0d;--surface:#1a1a1c;--surface2:#252528;--line:#2d2d31;--text:#f5f5f7;--muted:#9b9ba3;--accent:#43c184;--accent-soft:#163526;--accent-ink:#06170e;--danger:#ff6259;--danger-soft:#3a1917}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1920px;height:1080px;overflow:hidden;background:#050506}
+body{font-family:-apple-system,"SF Pro Display","SF Pro Text",BlinkMacSystemFont,Inter,sans-serif;-webkit-font-smoothing:antialiased;color:var(--text)}
+#stage{position:absolute;left:0;top:0;width:1920px;height:1080px;overflow:hidden;background:#070708}
+.layer{position:absolute;inset:0;overflow:hidden}
+.abs{position:absolute}
+/* kinetic type */
+.kt{font-weight:800;letter-spacing:-.045em;line-height:.95;white-space:nowrap}
+.w{display:inline-block;overflow:hidden;vertical-align:top;padding:.1em .06em .3em;margin:-.1em -.06em -.3em}
+.c{display:inline-block;will-change:transform}
+.grid{background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:80px 80px}
+.vig{position:absolute;inset:0;background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,.55) 100%);pointer-events:none}
+/* chips */
+.chip{position:absolute;left:0;top:0;display:flex;align-items:center;gap:12px;padding:10px 18px 10px 10px;background:#1a1a1c;border:1px solid #2d2d31;border-radius:16px;font-size:24px;font-weight:600;color:#d7d7dc;white-space:nowrap;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.chip i{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-style:normal;font-size:14px;font-weight:800;color:#0c0c0d}
+.chip small{color:#7d7d85;font-size:18px;font-weight:500;margin-left:4px}
+/* app window (designed at 2000x1250, same px as the README screenshots) */
+#win{position:absolute;left:0;top:0;width:2000px;height:1250px;background:#0c0c0d;border-radius:38px;overflow:hidden;font-size:19.5px;line-height:1.4;transform-origin:1000px 625px;box-shadow:0 0 0 2px #2a2a2e,0 80px 160px rgba(0,0,0,.7),0 0 240px rgba(67,193,132,.12)}
+#win svg{display:block}
+.pill{position:absolute;height:40px;border:1.5px solid var(--line);background:var(--surface);border-radius:999px;display:flex;align-items:center;gap:12px;padding:0 16px;font-weight:600;font-size:21px}
+.card{position:absolute;background:#121213;border:1.5px solid #262629;border-radius:26px;overflow:hidden}
+.row{position:absolute;left:0;width:100%;}
+.nm{position:absolute;font-weight:700;font-size:21px}
+.sb{position:absolute;color:var(--muted);font-size:17px;white-space:nowrap}
+.sz{position:absolute;right:22px;color:var(--muted);font-size:21px}
+.bar{position:absolute;height:5px;border-radius:3px;background:var(--accent)}
+.btn{position:absolute;border-radius:999px;display:flex;align-items:center;justify-content:center;gap:10px;font-weight:700;font-size:21px}
+.tab{position:absolute;top:1181px;width:120px;margin-left:-60px;text-align:center;color:var(--muted);font-size:16.5px;font-weight:500}
+.tab svg{margin:0 auto 6px}
+.tab.on{color:var(--accent);font-weight:700}
+#cursor{position:absolute;left:0;top:0;width:54px;height:54px;z-index:50;filter:drop-shadow(0 6px 8px rgba(0,0,0,.6))}
+.ripple{position:absolute;border:4px solid var(--accent);border-radius:50%;width:30px;height:30px;margin:-15px 0 0 -15px;z-index:49}
+.glass{position:absolute;background:rgba(26,26,28,.82);border:1.5px solid rgba(255,255,255,.12);border-radius:28px;backdrop-filter:blur(20px);padding:22px 30px;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+.bars{position:absolute;inset:0;z-index:100;pointer-events:none}
+.bars div{position:absolute;top:0;height:1080px}
+</style></head>
+<body><div id="stage"></div>
+<script>
+/* ---------- helpers ---------- */
+const clamp=(x,a=0,b=1)=>Math.min(b,Math.max(a,x));
+const ease={lin:x=>x,in3:x=>x*x*x,out3:x=>1-Math.pow(1-x,3),io3:x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2,outExpo:x=>x>=1?1:1-Math.pow(2,-10*x),inExpo:x=>x<=0?0:Math.pow(2,10*x-10),
+ outBack:(x,s=1.70158)=>1+(s+1)*Math.pow(x-1,3)+s*Math.pow(x-1,2),outBack2:x=>ease.outBack(x,2.8),outElastic:x=>x<=0?0:x>=1?1:Math.pow(2,-10*x)*Math.sin((x*10-.75)*(2*Math.PI/3))+1};
+const E=(t,a,b,f='out3')=>ease[f](clamp((t-a)/(b-a)));
+const lerp=(a,b,k)=>a+(b-a)*k;
+function rng(seed){return()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const stage=document.getElementById('stage');
+function mk(parent,html,style,cls){const d=document.createElement('div');if(cls)d.className=cls;if(style)d.style.cssText=style;if(html!=null)d.innerHTML=html;parent.appendChild(d);return d}
+const IC={
+ folder:'<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+ shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+ chat:'<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+ drive:'<path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/>',
+ history:'<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+ cpu:'<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
+ trash:'<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+ check:'<path d="M20 6 9 17l-5-5"/>',
+ up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
+ updown:'<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>',
+ undo:'<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/>',
+ min:'<path d="m14 10 7-7"/><path d="M20 10h-6V4"/><path d="m3 21 7-7"/><path d="M4 14h6v6"/>',
+ globe:'<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20"/>'
+};
+const ic=(n,s=24,c='currentColor',w=2)=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round">${IC[n]}</svg>`;
+/* kinetic text */
+function kt(parent,text,style,cls){const el=mk(parent,null,style,'kt '+(cls||''));const chars=[];
+ text.split(' ').forEach((w,wi,a)=>{const ws=document.createElement('span');ws.className='w';[...w].forEach(ch=>{const s=document.createElement('span');s.className='c';s.textContent=ch;ws.appendChild(s);chars.push(s)});el.appendChild(ws);if(wi<a.length-1)el.appendChild(document.createTextNode(' '))});
+ return{el,chars}}
+function ktA(k,t,tin,tout,o={}){const st=o.stag??.03,d=o.dur??.6,rot=o.rot??0,dir=o.dir??1;
+ k.chars.forEach((c,i)=>{const pi=E(t,tin+i*st,tin+i*st+d,o.e||'outExpo'),po=tout!=null?E(t,tout+i*st*.5,tout+i*st*.5+.3,'in3'):0;
+  c.style.transform=`translateY(${((1-pi)*110-po*110)*dir}%) rotate(${(1-pi)*rot}deg)`;c.style.opacity=(pi>0&&po<1)?1:0});
+ k.el.style.visibility=(t>=tin&&(tout==null||t<tout+.6))?'visible':'hidden'}
+const show=(el,c,d='block')=>{el.style.display=c?d:'none';return c};
+const T=(el,x,y,s=1,r=0,o=1)=>{el.style.transform=`translate(${x}px,${y}px) rotate(${r}deg) scale(${s})`;el.style.opacity=o};
+
+/* ================= SCENE 1: chaos ================= */
+const S1=mk(stage,null,'','layer');S1.style.background='radial-gradient(ellipse at 50% 45%,#1b1214 0%,#0a0708 70%)';
+mk(S1,null,'','layer grid');
+const names=[['IMG_4032.png','PNG','#ff9f6b'],['Untitled (3).pdf','PDF','#ff6b6b'],['installer_final_v2.dmg','DMG','#b38cff'],['Screenshot 2026-03-14.png','PNG','#ff9f6b'],['node_modules','DIR','#7cc4ff'],['budget_FINAL_final.xlsx','XLS','#5fd38d'],['download (17).zip','ZIP','#ffd166'],['Copy of Copy of notes.txt','TXT','#c7c7cc'],['holiday.mov','MOV','#ff7eb6'],['resume_old.docx','DOC','#7cc4ff'],['.DS_Store','SYS','#8e8e93'],['build_cache','DIR','#7cc4ff'],['backup_2019.tar.gz','TAR','#ffd166'],['IMG_4033.png','PNG','#ff9f6b'],['scan0042.jpg','JPG','#ff9f6b'],['setup.pkg','PKG','#b38cff'],['new folder (9)','DIR','#7cc4ff'],['meeting.mp4','MP4','#ff7eb6']];
+const R1=rng(7);const chips=[];
+for(let i=0;i<40;i++){const n=names[i%names.length];const el=mk(S1,`<i style="background:${n[2]}">${n[1]}</i>${n[0]}${i%5==0?'<small>'+(R1()*4+.2).toFixed(1)+' GB</small>':''}`,'','chip');
+ const d=.55+R1()*.9;chips.push({el,x:R1()*1800+40,y:R1()*980+20,vx:(R1()-.5)*130,vy:(R1()-.5)*110,r:(R1()-.5)*50,vr:(R1()-.5)*24,d,dl:R1()*1.3,blur:d<.8?4:d<1?1.5:0})}
+const s1c=mk(S1,null,'position:absolute;z-index:50;left:0;top:0;width:1920px;height:1080px;transform-origin:960px 540px');
+const numEl=mk(s1c,'0','position:absolute;left:0;width:1920px;top:250px;text-align:center;font-size:330px;font-weight:800;letter-spacing:-.05em;line-height:1;text-shadow:0 10px 60px rgba(0,0,0,.8);font-variant-numeric:tabular-nums');
+const numSub=kt(s1c,'files on your Mac.','position:absolute;left:0;width:1920px;top:600px;text-align:center;font-size:84px;color:#cfcfd4;font-weight:700');
+numSub.el.style.textAlign='center';
+const sb1=kt(s1c,'SORTED BY','position:absolute;left:0;width:1920px;top:250px;text-align:center;font-size:130px;color:#fff;letter-spacing:.02em;font-weight:800');
+const sb2=kt(s1c,'NOBODY.','position:absolute;left:0;width:1920px;top:400px;text-align:center;font-size:360px;color:#ff6259;font-weight:900');
+const flash=mk(stage,null,'position:absolute;inset:0;background:#fff;opacity:0;z-index:90;pointer-events:none');
+const vig1=mk(S1,null,'','vig');
+
+/* ================= SCENE 2: meet Tidy ================= */
+const S2=mk(stage,null,'background:linear-gradient(135deg,#1f7a4d,#43c184);','layer');
+const rings=[0,1,2].map(i=>mk(S2,null,'position:absolute;left:960px;top:400px;border:3px solid rgba(255,255,255,.35);border-radius:50%'));
+const logo=mk(S2,'<img src="assets/logo.png" style="width:100%;height:100%;border-radius:64px;display:block">','position:absolute;left:810px;top:50px;width:300px;height:300px;border-radius:64px;box-shadow:0 40px 100px rgba(0,30,15,.45)');
+const shine=mk(logo,null,'position:absolute;inset:0;border-radius:64px;background:linear-gradient(115deg,transparent 35%,rgba(255,255,255,.75) 50%,transparent 65%);mix-blend-mode:overlay');
+const meet=kt(S2,'Meet','position:absolute;left:0;width:1920px;top:372px;text-align:center;font-size:66px;color:rgba(255,255,255,.85);letter-spacing:.02em;font-weight:700');
+const tidy=kt(S2,'Tidy.','position:absolute;left:0;width:1920px;top:440px;text-align:center;font-size:330px;color:#fff;font-weight:900;letter-spacing:-.035em');
+const tag1=kt(S2,'Tell your Mac what to do —','position:absolute;left:0;width:1920px;top:815px;text-align:center;font-size:62px;color:#fff;font-weight:700;letter-spacing:-.02em');
+const tag2=kt(S2,'in plain English.','position:absolute;left:0;width:1920px;top:895px;text-align:center;font-size:62px;color:#06170e;font-weight:800;letter-spacing:-.02em');
+
+/* ================= SCENE 3: window ================= */
+const S3=mk(stage,null,'background:radial-gradient(ellipse at 70% 50%,#10241a 0%,#070708 65%)','layer');
+mk(S3,null,'','layer grid');
+const glow=mk(S3,null,'position:absolute;left:1000px;top:200px;width:800px;height:800px;border-radius:50%;background:radial-gradient(circle,rgba(67,193,132,.22),transparent 65%)');
+const cam=mk(S3,null,'position:absolute;left:0;top:0;width:2000px;height:1250px;transform-origin:1000px 625px');
+const win=mk(cam,null,'','');win.id='win';win.style.transformOrigin='0 0';win.style.position='absolute';
+// we transform cam; win just sits inside
+cam.appendChild(win);
+/* top bar */
+[['#ff5f57',22],['#febc2e',54],['#28c840',86]].forEach(([c,x])=>mk(win,null,`left:${x-9}px;top:13px;width:18px;height:18px;border-radius:50%;background:${c};position:absolute`));
+mk(win,'<img src="assets/logo.png" style="width:100%;height:100%;border-radius:9px">','position:absolute;left:117px;top:18px;width:36px;height:36px');
+mk(win,'Tidy','position:absolute;left:165px;top:19px;font-size:24px;font-weight:700');
+mk(win,ic('folder',24,'var(--accent)')+'<span>TidyDemo</span>'+ic('updown',20),'left:222px;top:16px;width:194px;height:40px;','pill');
+mk(win,ic('cpu',22)+'<span style="white-space:nowrap;overflow:hidden">Qwen3 4B Instruct 2507 · Q4</span>'+ic('updown',20),'left:431px;top:16px;width:360px;height:40px;','pill');
+mk(win,ic('min',22),'position:absolute;left:1940px;top:16px;width:40px;height:40px;border-radius:50%;border:1.5px solid var(--line);background:var(--surface);display:grid;place-items:center');
+mk(win,'v0.9.0 · TidyDemo','position:absolute;right:20px;top:1214px;font-size:16px;color:var(--muted)');
+/* chat page */
+const chat=mk(win,null,'position:absolute;inset:0');
+const userB=mk(chat,'remove the curseforge instances that are not the 26.2 version','position:absolute;right:453px;top:83px;height:52px;padding:0 20px;background:#6cc18b;color:#0a2516;border-radius:26px;font-size:20px;line-height:52px;white-space:nowrap;transform-origin:100% 50%');
+const aiB=mk(chat,'4 of the folders in “Instances” (117 KB) are ready for the Trash — each moves whole and stays recoverable. Keeping Skyblock (Minecraft 26.2), Test World (Minecraft 26.2) (matching 26.2).<br><br>Uncheck anything you want to keep. Nothing happens until you approve.','position:absolute;left:453px;top:150px;width:962px;height:131px;padding:16px 20px;background:#141415;border:1.5px solid #262629;border-radius:26px;font-size:20px;line-height:26px;transform-origin:0 0');
+const keptG=mk(chat,null,'left:453px;top:293px;width:1094px;height:225px','card');
+mk(keptG,'Kept (matches what you wanted to keep)','position:absolute;left:20px;top:16px;font-weight:700;font-size:21px');mk(keptG,'2','position:absolute;right:20px;top:18px;color:var(--muted);font-size:17px');
+[['Skyblock',56],['Test World',140]].forEach(([n,y])=>{const r=mk(keptG,null,`top:${y}px;height:85px;border-top:1.5px solid #262629`,'row');r.style.position='absolute';
+ mk(r,ic('folder',30,'var(--accent)'),'position:absolute;left:20px;top:18px');mk(r,n,'left:60px;top:10px','nm');mk(r,'Games/curseforge/minecraft/Instances · 7 files · Minecraft 26.2 · kept','left:60px;top:40px','sb');mk(r,'29 KB',' top:20px','sz');mk(r,null,'left:60px;top:68px;width:946px;','bar')});
+const readyG=mk(chat,null,'left:453px;top:531px;width:1094px;height:363px','card');
+mk(readyG,'Ready for the Trash','position:absolute;left:20px;top:19px;font-weight:700;font-size:21px');mk(readyG,'Deselect all','position:absolute;right:30px;top:19px;color:var(--accent);font-weight:700;font-size:21px');
+const rrows=[],rchecks=[];
+[['Cobbleverse','1.21.1'],['Old Legacy','1.12.2'],['Tech Pack','1.21.1'],['Vanilla Plus','1.20.1']].forEach(([n,v],i)=>{const r=mk(readyG,null,`top:${63+i*75}px;height:75px;border-top:1.5px solid #262629`,'row');
+ const cb=mk(r,ic('check',20,'#06170e',3.5),'position:absolute;left:22px;top:23px;width:28px;height:28px;border-radius:8px;border:2px solid #4a4a50;display:grid;place-items:center');
+ mk(r,ic('folder',30,'var(--accent)'),'position:absolute;left:64px;top:22px');mk(r,n,'left:103px;top:10px','nm');mk(r,`Games/curseforge/minecraft/Instances · 7 files · Minecraft ${v}`,'left:103px;top:40px','sb');mk(r,'29 KB','top:26px','sz');rrows.push(r);rchecks.push(cb)});
+const doneG=mk(chat,null,'left:453px;top:531px;width:1094px;height:363px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;background:linear-gradient(180deg,#12261b,#0f1a14);border-color:#275a3f','card');
+const doneCk=mk(doneG,ic('check',64,'#06170e',3.4),'width:110px;height:110px;border-radius:50%;background:var(--accent);display:grid;place-items:center;margin-bottom:18px');
+mk(doneG,'4 folders moved to the Trash','font-size:36px;font-weight:800');mk(doneG,'117 KB freed · every one recoverable from History','font-size:21px;color:#a8d8bf;margin-top:6px');
+const parts=[];const Rp=rng(3);for(let i=0;i<26;i++){parts.push({el:mk(chat,null,`position:absolute;width:${10+Rp()*12}px;height:${10+Rp()*12}px;border-radius:${Rp()>.5?'50%':'3px'};background:${Rp()>.3?'#43c184':'#f5f5f7'};left:1000px;top:645px`),a:Rp()*Math.PI*2,v:260+Rp()*420,rot:Rp()*720})}
+const sticky=mk(chat,'<div style="position:absolute;left:23px;top:15px;font-weight:800;font-size:21px">4 selected · 117 KB</div><div style="position:absolute;left:23px;top:42px;color:var(--muted);font-size:17px">Nothing changes until you approve</div>','left:451px;top:982px;width:1098px;height:81px;border-radius:24px;background:#151516;border:1.5px solid #262629','abs');
+const reviewBtn=mk(sticky,ic('shield',26,'#06170e',2.4)+'Review','left:941px;top:15px;width:139px;height:52px;background:var(--accent);color:#06170e','btn');
+const comp=mk(chat,null,'left:451px;top:1076px;width:1098px;height:65px;border-radius:33px;background:#151516;border:1.5px solid #262629','abs');
+const compTxt=mk(comp,'Ask Tidy about TidyDemo…','position:absolute;left:20px;top:18px;font-size:21px;color:#75757c;white-space:nowrap');
+const send=mk(comp,ic('up',26,'#fff',2.6),'position:absolute;left:1042px;top:9px;width:48px;height:48px;border-radius:50%;background:#2f5c45;display:grid;place-items:center');
+const caret=mk(comp,null,'position:absolute;top:16px;width:2px;height:30px;background:#fff');
+/* history page */
+const hist=mk(win,null,'position:absolute;left:0;top:72px;width:2000px;height:1089px;background:#0c0c0d');
+mk(hist,'History','position:absolute;left:447px;top:26px;font-size:60px;font-weight:800;letter-spacing:-.03em');
+mk(hist,'Every change is journaled — where it was, where it went. Undo anything.','position:absolute;left:447px;top:102px;font-size:22px;color:var(--muted)');
+const hg=mk(hist,null,'left:447px;top:170px;width:1106px;height:610px','card');
+const hrows=[];
+[['trash','Moved 4 folders to the Trash','just now · Games/curseforge/minecraft/Instances · 117 KB','Put back'],['folder','Organized Inbox by type','12 min ago · 500 items in 1 batch','Undo all'],['undo','Renamed 38 files','yesterday · spaces → underscores','Undo'],['trash','Removed 12 duplicate files','2 days ago · 84 MB','Put back']].forEach(([i,n,s,b],k)=>{
+ const r=mk(hg,null,`top:${k*152}px;height:152px;${k?'border-top:1.5px solid #262629':''}`,'row');
+ mk(r,ic(i,34,'var(--accent)',2),'position:absolute;left:30px;top:50px;width:52px;height:52px;border-radius:14px;background:var(--accent-soft);display:grid;place-items:center');
+ const nm=mk(r,n,'left:106px;top:40px;font-size:26px','nm');mk(r,s,'left:106px;top:80px;font-size:19px','sb');
+ const bt=mk(r,ic('undo',22,'var(--accent)',2.4)+'<span>'+b+'</span>','right:30px;top:48px;height:56px;padding:0 26px;background:var(--accent-soft);color:var(--accent)','btn');
+ hrows.push({r,nm,bt,sb:r.querySelector('.sb'),b})});
+const restored=mk(hg,null,'left:0;top:0;width:100%;height:152px;background:linear-gradient(90deg,rgba(67,193,132,.35),rgba(67,193,132,.08));opacity:0;pointer-events:none');
+/* tab bar */
+const tabbar=mk(win,null,'position:absolute;left:0;top:1161px;width:2000px;height:89px;background:#1a1a1c;border-top:1.5px solid #2a2a2e');
+const tabs=[['chat','Chat',846],['drive','Storage',948],['history','History',1058],['cpu','AI',1155]].map(([i,n,x])=>{const d=mk(win,ic(i,34),`left:${x}px`,'tab');d.insertAdjacentHTML('beforeend','<div>'+n+'</div>');return d});
+/* review sheet */
+const dim=mk(win,null,'position:absolute;inset:0;background:rgba(0,0,0,.6);opacity:0;top:72px');
+const sheet=mk(win,null,'left:680px;top:380px;width:640px;height:480px;background:#1a1a1c;border:1.5px solid #34343a;border-radius:34px;box-shadow:0 50px 120px rgba(0,0,0,.7);transform-origin:50% 50%','abs');
+mk(sheet,ic('shield',44,'var(--accent)',2),'position:absolute;left:40px;top:38px;width:84px;height:84px;border-radius:24px;background:var(--accent-soft);display:grid;place-items:center');
+mk(sheet,'Review &amp; approve','position:absolute;left:146px;top:40px;font-size:38px;font-weight:800;letter-spacing:-.02em');
+mk(sheet,'4 folders will move to the Trash · 117 KB','position:absolute;left:146px;top:94px;font-size:21px;color:var(--muted)');
+const sheetRows=['Nothing is overwritten','Every item recoverable with Put back','Journaled before anything runs'].map((s,i)=>mk(sheet,`<span style="width:34px;height:34px;border-radius:50%;background:var(--accent);display:grid;place-items:center">${ic('check',20,'#06170e',3.4)}</span><span>${s}</span>`,`position:absolute;left:44px;top:160px;width:560px;display:flex;align-items:center;gap:16px;font-size:24px;font-weight:600;top:${166+i*58}px`));
+mk(sheet,'Cancel','left:36px;top:388px;width:236px;height:60px;background:var(--surface2);color:var(--text)','btn');
+const approve=mk(sheet,ic('shield',26,'#06170e',2.4)+'Approve','left:300px;top:388px;width:304px;height:60px;background:var(--accent);color:#06170e;font-size:23px','btn');
+/* cursor + ripple */
+const curs=mk(win,'<svg viewBox="0 0 24 24" width="54" height="54"><path d="M4 2l15 9-6.5 1.6L9 19z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg>','');curs.id='cursor';
+const rip=mk(win,null,'','ripple');
+
+/* stage-level big labels for scene 3 */
+const LB=[['SAY','IT.',5.5,8.85],['REVIEW','IT.',9.05,11.05],['ONE','CLICK.',11.15,12.35],['UNDO','ANYTHING.',12.95,14.05]].map(([a,b,ti,to],i)=>{
+ const sz=i==3?128:150;
+ const k1=kt(S3,a,`position:absolute;left:90px;top:330px;font-size:${sz}px;color:#fff`),k2=kt(S3,b,`position:absolute;left:90px;top:${330+sz*.95}px;font-size:${sz}px;color:var(--accent)`);
+ return{k1,k2,ti,to}});
+const subLbl=kt(S3,'in plain English.','position:absolute;left:96px;top:680px;font-size:48px;color:#9b9ba3;font-weight:600;letter-spacing:-.02em');
+const subLbl2=kt(S3,'Nothing runs until you approve.','position:absolute;left:96px;top:690px;font-size:34px;color:#9b9ba3;font-weight:600;letter-spacing:-.02em');
+const subLbl3=kt(S3,'Every change is journaled.','position:absolute;left:96px;top:700px;font-size:40px;color:#9b9ba3;font-weight:600;letter-spacing:-.02em');
+
+/* ================= SCENE 5: storage ================= */
+const S5=mk(stage,null,'background:radial-gradient(ellipse at 65% 55%,#10241a 0%,#070708 65%)','layer');mk(S5,null,'','layer grid');
+const sWrap=mk(S5,null,'position:absolute;left:720px;top:170px;width:1150px;height:719px;perspective:2200px');
+const sCard=mk(sWrap,'<img src="assets/storage.png" style="width:100%;height:100%;border-radius:22px;display:block">','position:absolute;inset:0;border-radius:22px;box-shadow:0 0 0 2px #2a2a2e,0 60px 140px rgba(0,0,0,.75),0 0 200px rgba(67,193,132,.15);transform-origin:50% 50%');
+const sLines=['KNOW','WHERE','IT WENT.'].map((s,i)=>kt(S5,s,`position:absolute;left:84px;top:${230+i*140}px;font-size:150px;color:${i==2?'var(--accent)':'#fff'}`));
+const gUsed=mk(S5,null,'left:1000px;top:820px;width:520px','glass');
+const gBig=mk(gUsed,'0','font-size:70px;font-weight:800;letter-spacing:-.03em');mk(gUsed,'GB used · real allocated size','font-size:22px;color:var(--muted);margin-top:-4px');
+const gBar=mk(gUsed,'<div style="height:100%;background:var(--accent);border-radius:8px;width:0"></div>','height:14px;border-radius:8px;background:#2d2d31;margin-top:14px');
+const gInbox=mk(S5,null,'left:1480px;top:80px;width:380px','glass');mk(gInbox,ic('folder',28,'var(--accent)')+'<b style="font-size:30px">Inbox</b><span style="margin-left:auto;font-size:30px;color:var(--muted)">10.4 MB</span>','display:flex;gap:12px;align-items:center');
+mk(gInbox,null,'height:8px;margin-top:14px;border-radius:5px;background:#2d2d31','').innerHTML='<div style="height:100%;background:var(--accent);border-radius:5px;width:0"></div>';
+const gTip=mk(S5,null,'left:1340px;top:880px;width:480px','glass');gTip.innerHTML='<div style="font-size:26px;font-weight:800">💡 176 KB of build files</div><div style="font-size:19px;color:var(--muted);margin-top:4px">Your tools can recreate them. Ask Tidy →</div>';
+
+/* ================= SCENE 6: pillars ================= */
+const P6=[['PLAIN','ENGLISH.','#43c184','#06170e','#0b3a24','chat','“organize by date”, “delete the 10 biggest”','right'],['SAFE BY','DESIGN.','#f5f5f7','#0c0c0d','#2b8a5a','shield','Review → Approve → Undo. No permanent deletes.','left'],['100%','LOCAL.','#0c0c0d','#ffffff','#43c184','cpu','No cloud. No account. No telemetry.','top']].map(([a,b,bg,fg,ac,i,sub,from],k)=>{
+ const el=mk(stage,null,`background:${bg};`,'layer');
+ const k1=kt(el,a,`position:absolute;left:0;width:1920px;text-align:center;top:180px;font-size:290px;color:${fg}`);
+ const k2=kt(el,b,`position:absolute;left:0;width:1920px;text-align:center;top:450px;font-size:290px;color:${ac}`);
+ const sub_=kt(el,sub,`position:absolute;left:0;width:1920px;text-align:center;top:820px;font-size:46px;color:${fg};opacity:.75;font-weight:600;letter-spacing:-.02em`);
+ const icn=mk(el,ic(i,120,ac,1.6),'position:absolute;left:1560px;top:90px;opacity:.9');
+ if(k==2)mk(el,null,'','layer grid');
+ return{el,k1,k2,sub:sub_,icn,from}});
+const P6t=[16.3,17.25,18.2,19.15];
+
+/* ================= SCENE 7: outro ================= */
+const S7=mk(stage,null,'background:radial-gradient(ellipse at 50% 40%,#123a27 0%,#070708 70%)','layer');mk(S7,null,'','layer grid');
+const oLogo=mk(S7,'<img src="assets/logo.png" style="width:100%;height:100%;border-radius:50px;display:block">','position:absolute;left:830px;top:100px;width:260px;height:260px;border-radius:50px;box-shadow:0 30px 100px rgba(67,193,132,.35)');
+const oShine=mk(oLogo,null,'position:absolute;inset:0;border-radius:50px;background:linear-gradient(115deg,transparent 35%,rgba(255,255,255,.8) 50%,transparent 65%);mix-blend-mode:overlay');
+const oTidy=kt(S7,'Tidy','position:absolute;left:0;width:1920px;text-align:center;top:360px;font-size:330px;color:#fff;font-weight:900;letter-spacing:-.06em');
+const oTag=[kt(S7,'Tell your Mac.','position:absolute;left:0;width:640px;text-align:center;top:760px;font-size:54px;color:#fff;font-weight:700;letter-spacing:-.02em;left:320px'),kt(S7,'Review the plan.','position:absolute;width:640px;text-align:center;top:760px;font-size:54px;color:#fff;font-weight:700;letter-spacing:-.02em;left:640px'),kt(S7,'Undo anything.','position:absolute;width:640px;text-align:center;top:760px;font-size:54px;color:#43c184;font-weight:800;letter-spacing:-.02em;left:960px')];
+oTag.forEach((k,i)=>k.el.style.left=(240+i*480)+'px');oTag.forEach(k=>k.el.style.width='480px');
+const oPills=mk(S7,null,'position:absolute;left:0;width:1920px;top:900px;display:flex;gap:18px;justify-content:center');
+['Free &amp; open source','macOS','100% local AI'].forEach(s=>mk(oPills,s,'padding:14px 28px;border-radius:999px;border:1.5px solid #2d5a45;background:rgba(67,193,132,.1);color:#9be3c0;font-size:28px;font-weight:700'));
+const oUrl=mk(S7,'github.com/NicolasLasch/Tidy','position:absolute;left:0;width:1920px;text-align:center;top:985px;font-size:32px;color:#9b9ba3;font-weight:600;letter-spacing:.01em');
+const oWipe=mk(stage,null,'position:absolute;left:960px;top:540px;width:10px;height:10px;margin:-5px;border-radius:50%;background:#43c184;z-index:60');
+
+/* bars transitions */
+const barsLayers=[];
+function mkBars(color,tc){const b=mk(stage,null,'','bars');const cols=[];const n=8;for(let i=0;i<n;i++){cols.push(mk(b,null,`left:${i*240}px;width:241px;background:${color};transform:scaleY(0)`))}barsLayers.push({b,cols,tc,n})}
+mkBars('#f5f5f7',5.4);mkBars('#43c184',14.4);
+function updBars(t){barsLayers.forEach(({b,cols,tc,n})=>{b.style.display=(t>tc-.45&&t<tc+.5)?'block':'none';cols.forEach((c,i)=>{const d=i*.028,cv=E(t,tc-.36+d,tc-.1+d,'io3'),un=E(t,tc+.02+(n-1-i)*.028,tc+.3+(n-1-i)*.028,'io3');c.style.transformOrigin=t<tc?'50% 100%':'50% 0%';c.style.transform=`scaleY(${cv*(1-un)})`})})}
+
+/* ================= camera / cursor plumbing ================= */
+const CENTER={x:1000,y:625};
+const camAt=(F,Pp,S)=>({cx:Pp.x-(F.x-CENTER.x)*S,cy:Pp.y-(F.y-CENTER.y)*S,S});
+const kf=[ // t, camera, rotY
+ [5.4,{cx:1260,cy:1100,S:.42},34],[6.15,{cx:1275,cy:560,S:.58},-9],[8.65,{cx:1275,cy:560,S:.58},-5],
+ [9.45,camAt({x:1150,y:900},{x:1230,y:640},.98),0],[12.25,camAt({x:1150,y:900},{x:1230,y:640},.98),0],
+ [13.0,{cx:1180,cy:560,S:.74},-3],[14.4,{cx:1180,cy:560,S:.74},-3]];
+function camState(t){for(let i=0;i<kf.length-1;i++){const a=kf[i],b=kf[i+1];if(t<=b[0]){const k=ease[i==0?'outExpo':'io3'](clamp((t-a[0])/(b[0]-a[0])));return{cx:lerp(a[1].cx,b[1].cx,k),cy:lerp(a[1].cy,b[1].cy,k),S:lerp(a[1].S,b[1].S,k),ry:lerp(a[2],b[2],k)}}}const l=kf[kf.length-1];return{...l[1],ry:l[2]}}
+const cpath=[[9.5,1800,1000],[10.12,1461,1023],[10.6,1461,1023],[11.05,1132,822+0],[11.3,1132,822],[12.45,1200,900],[12.85,1058,1200],[13.05,1058,1200],[13.5,1450,244+72+76],[14.4,1450,390]];
+function cursorPos(t){if(t<cpath[0][0])return null;for(let i=0;i<cpath.length-1;i++){const a=cpath[i],b=cpath[i+1];if(t<=b[0]){const k=ease.io3(clamp((t-a[0])/(b[0]-a[0])));return{x:lerp(a[1],b[1],k),y:lerp(a[2],b[2],k)}}}const l=cpath[cpath.length-1];return{x:l[1],y:l[2]}}
+const clicks=[10.15,11.05,12.95,13.85];
+const PROMPT='remove the curseforge instances that are not the 26.2 version';
+
+/* ================= main seek ================= */
+function seek(t){
+ /* S1 */
+ if(show(S1,t<3.4)){
+  const fast=t>1.75?2.6:1;
+  chips.forEach((c,i)=>{const pin=E(t,c.dl*.6,c.dl*.6+.5,'outBack');const tt=t<1.75?t:1.75+(t-1.75)*fast;
+   const sh=(t>2.3&&t<2.65)?(Math.sin(t*90+i)*10):0;
+   c.el.style.transform=`translate(${c.x+c.vx*tt+sh}px,${c.y+c.vy*tt}px) rotate(${c.r+c.vr*tt}deg) scale(${pin*c.d})`;c.el.style.opacity=pin>0?Math.min(1,pin)*(c.d<.8?.55:1):0;c.el.style.filter=`blur(${c.blur}px)`;c.el.style.zIndex=Math.round(c.d*10)});
+  const n=Math.round(47312*ease.outExpo(clamp((t-.1)/1.35)));numEl.textContent=n.toLocaleString('en-US');
+  const showNum=t<1.72;numEl.style.display=showNum?'block':'none';numEl.style.transform=`scale(${1+E(t,0,1.7,'lin')*.06})`;numEl.style.opacity=E(t,0,.12)*(1-E(t,1.62,1.72));
+  ktA(numSub,t,.45,1.55,{stag:.028,rot:6});
+  ktA(sb1,t,1.75,null,{stag:.035,dur:.5,e:'outBack'});ktA(sb2,t,1.85,null,{stag:.05,dur:.6,e:'outBack2',rot:-10});
+  const gl=(t>2.25&&t<2.7);const jx=gl?Math.sin(t*140)*14:0;
+  sb2.el.style.transform=`translateX(${jx}px)`;sb2.el.style.textShadow=gl?`8px 0 #00e5ff,-8px 0 #ff2fb3`:'0 10px 60px rgba(0,0,0,.6)';
+  s1c.style.transform=`scale(${1+E(t,2.75,3.35,'in3')*.9})`;s1c.style.opacity=1-E(t,2.85,3.3,'in3');
+  flash.style.opacity=.55*(1-E(t,1.75,1.95))*(t>=1.75?1:0);
+ }else flash.style.opacity=0;
+ /* S2 */
+ if(show(S2,t>=2.8&&t<5.45)){
+  const r=E(t,2.8,3.4,'io3')*1500;S2.style.clipPath=`circle(${r}px at 960px 540px)`;
+  rings.forEach((el,i)=>{const p=E(t,3.15+i*.16,3.15+i*.16+1.1,'out3');const d=300+p*1500;el.style.width=el.style.height=d+'px';el.style.marginLeft=el.style.marginTop=-d/2+'px';el.style.opacity=(1-p)*(t>3.15?1:0)});
+  const lp=E(t,3.1,3.75,'outBack2');T(logo,0,0,lp,(1-E(t,3.1,4.0,'outElastic'))*-28,lp>0?1:0);
+  logo.style.transform=`scale(${lp}) rotate(${(1-E(t,3.1,4.0,'outElastic'))*-28}deg) translateY(${Math.sin((t-3.8)*3)*(t>3.8?8:0)}px)`;
+  shine.style.backgroundPosition=`${-300+E(t,3.6,4.2,'io3')*600}px 0`;shine.style.backgroundSize='300% 100%';shine.style.opacity=t>3.6&&t<4.3?1:0;
+  ktA(meet,t,3.35,5.05,{stag:.04});ktA(tidy,t,3.45,5.05,{stag:.06,dur:.7,e:'outBack2',rot:8});
+  ktA(tag1,t,3.95,5.05,{stag:.02,dur:.5});ktA(tag2,t,4.25,5.05,{stag:.025,dur:.5});
+  S2.style.transform=`scale(${1+E(t,4.9,5.4,'in3')*.06})`;
+ }
+ /* S3 */
+ if(show(S3,t>=5.3&&t<14.5)){
+  const c=camState(t);cam.style.transform=`translate(${c.cx-1000}px,${c.cy-625}px) perspective(2600px) rotateY(${c.ry}deg) scale(${c.S})`;
+  cam.style.opacity=E(t,5.4,5.6);
+  glow.style.transform=`translate(${Math.sin(t*.8)*60}px,${Math.cos(t*.6)*40}px)`;
+  LB.forEach(l=>{ktA(l.k1,t,l.ti,l.to,{stag:.045,dur:.6,e:'outBack2'});ktA(l.k2,t,l.ti+.12,l.to+.06,{stag:.04,dur:.6,e:'outBack2'})});
+  ktA(subLbl,t,5.95,8.75,{stag:.02});ktA(subLbl2,t,9.45,11.0,{stag:.015,dur:.45});ktA(subLbl3,t,13.3,14.0,{stag:.015,dur:.45});
+  /* typing */
+  const tp=clamp((t-6.05)/1.0);const nch=Math.floor(tp*PROMPT.length);
+  let typing=t>=6.05&&t<7.2;
+  if(t<6.05){compTxt.textContent='Ask Tidy about TidyDemo…';compTxt.style.color='#75757c';caret.style.opacity=(Math.floor(t*2.2)%2);caret.style.left='20px'}
+  else if(t<7.2){compTxt.textContent=PROMPT.slice(0,nch);compTxt.style.color='#f5f5f7';caret.style.left=(22+compTxt.offsetWidth)+'px';caret.style.opacity=1}
+  else{compTxt.textContent=t<8.85?'Ask Tidy about TidyDemo…':'Say “yes” to review, or refine…';compTxt.style.color='#75757c';caret.style.opacity=0}
+  send.style.background=(t>=6.3&&t<7.2)?'#43c184':'#2f5c45';send.style.transform=`scale(${1-.12*E(t,7.1,7.2)*(1-E(t,7.2,7.3))})`;
+  /* bubbles */
+  const up=E(t,7.2,7.6,'outBack2');userB.style.transform=`scale(${.5+.5*up}) translateY(${(1-up)*40}px)`;userB.style.opacity=clamp(up*3)*(t>7.15?1:0);
+  const ap=E(t,7.45,7.95,'outExpo');aiB.style.transform=`translateY(${(1-ap)*30}px)`;aiB.style.opacity=ap;
+  const kp=E(t,7.75,8.25,'outExpo');keptG.style.transform=`translateY(${(1-kp)*50}px)`;keptG.style.opacity=kp;
+  const rp=E(t,8.0,8.5,'outExpo');readyG.style.transform=`translateY(${(1-rp)*60}px)`;readyG.style.opacity=rp*(1-E(t,11.25,11.5));
+  rrows.forEach((r,i)=>{const p=E(t,8.05+i*.09,8.45+i*.09,'outExpo');const out=E(t,11.22+i*.07,11.62+i*.07,'in3');r.style.opacity=p*(1-out);r.style.transform=`translateX(${(1-p)*80+out*700}px)`;
+   const ck=rchecks[i],cp=E(t,8.5+i*.1,8.75+i*.1,'outBack2');ck.style.background=cp>0?'#43c184':'transparent';ck.style.borderColor=cp>0?'#43c184':'#4a4a50';ck.firstChild&&(ck.firstChild.style.transform=`scale(${cp})`);ck.style.transform=`scale(${1+.25*Math.sin(cp*Math.PI)})`});
+  const sp=E(t,8.85,9.3,'outBack');sticky.style.transform=`translateY(${(1-sp)*140 + E(t,11.25,11.55,'in3')*160}px)`;sticky.style.opacity=sp*(1-E(t,11.3,11.55));
+  const pu=t>9.2&&t<10.1?1+.05*Math.sin((t-9.2)*12):1;const pr=(t>10.07&&t<10.2)?.9:1;reviewBtn.style.transform=`scale(${pu*pr})`;
+  comp.style.opacity=1;
+  /* sheet */
+  const sOpen=E(t,10.2,10.5,'outBack2'),sClose=E(t,11.1,11.3,'in3');
+  dim.style.opacity=(E(t,10.2,10.4)*(1-sClose));show(dim,t>10.15&&t<11.35);dim.style.display=dim.style.display;
+  show(sheet,t>10.15&&t<11.35);sheet.style.transform=`scale(${(.82+.18*sOpen)*(1-.06*sClose)})`;sheet.style.opacity=clamp(sOpen*3)*(1-sClose);
+  sheetRows.forEach((r,i)=>{const p=E(t,10.4+i*.12,10.7+i*.12,'outExpo');r.style.opacity=p;r.style.transform=`translateX(${(1-p)*-40}px)`});
+  approve.style.transform=`scale(${(t>11.0&&t<11.12)?.93:1})`;
+  /* done card */
+  const dp=E(t,11.45,11.95,'outBack2');show(doneG,t>=11.4,'flex');doneG.style.transform=`scale(${.85+.15*dp})`;doneG.style.opacity=clamp(dp*2);
+  doneCk.style.transform=`scale(${E(t,11.6,12.0,'outBack2')})`;
+  parts.forEach(p=>{const k=E(t,11.6,12.35,'out3');const x=1000+Math.cos(p.a)*p.v*k*.9,y=645+Math.sin(p.a)*p.v*k*.9+k*k*40;p.el.style.transform=`translate(${x-1000}px,${y-645}px) rotate(${p.rot*k}deg)`;p.el.style.opacity=(t>11.6&&t<12.4)?1-E(t,11.9,12.35,'lin'):0});
+  /* history page + tabs */
+  const hp=E(t,12.85,13.3,'outExpo');show(hist,t>=12.85);hist.style.opacity=hp;hist.style.transform=`translateY(${(1-hp)*70}px)`;
+  const onTab=t>=12.9?2:0;tabs.forEach((d,i)=>{d.className='tab'+(i==onTab?' on':'')});
+  hrows.forEach((h,i)=>{const p=E(t,13.0+i*.07,13.4+i*.07,'outExpo');h.r.style.opacity=p;h.r.style.transform=`translateX(${(1-p)*60}px)`});
+  const rs=t>=13.5;const h0=hrows[0];
+  h0.nm.textContent=rs?'Restored 4 folders':'Moved 4 folders to the Trash';h0.sb.textContent=rs?'Put back exactly where they were · nothing overwritten':'just now · Games/curseforge/minecraft/Instances · 117 KB';
+  h0.bt.innerHTML=rs?ic('check',24,'#06170e',3.4)+'<span>Restored</span>':ic('undo',22,'var(--accent)',2.4)+'<span>Put back</span>';
+  h0.bt.style.background=rs?'#43c184':'var(--accent-soft)';h0.bt.style.color=rs?'#06170e':'var(--accent)';
+  h0.bt.style.transform=`scale(${(t>13.45&&t<13.56)?.92:1+(rs?.12*Math.sin(E(t,13.5,13.8,'lin')*Math.PI):0)})`;
+  restored.style.opacity=rs?(1-E(t,13.5,14.2,'lin')):0;
+  /* cursor */
+  const cp=cursorPos(t);curs.style.display=cp?'block':'none';if(cp){curs.style.transform=`translate(${cp.x-6}px,${cp.y-4}px)`}
+  let rk=null;clicks.forEach(c=>{if(t>=c&&t<c+.45)rk=c});
+  if(rk&&cp){const k=E(t,rk,rk+.45,'out3');rip.style.display='block';rip.style.transform=`translate(${cp.x}px,${cp.y}px) scale(${1+k*4})`;rip.style.opacity=1-k}else rip.style.display='none';
+  curs.style.scale=(rk&&t<rk+.1)?.85:1;
+ }
+ /* S5 storage */
+ if(show(S5,t>=14.35&&t<16.4)){
+  const lp=(t-14.4);sCard.style.transform=`rotateY(${lerp(-18,-6,E(t,14.4,16.4,'out3'))}deg) rotateX(${lerp(7,2,E(t,14.4,16.4,'out3'))}deg) scale(${lerp(.92,1.02,E(t,14.4,16.4,'lin'))}) translateY(${(1-E(t,14.45,15.0,'outExpo'))*120}px)`;
+  sCard.style.opacity=E(t,14.45,14.8);
+  sLines.forEach((k,i)=>ktA(k,t,14.55+i*.12,16.25,{stag:.04,dur:.55,e:'outBack2'}));
+  const gp=E(t,15.0,15.5,'outBack2');gUsed.style.transform=`scale(${gp}) translateY(${(1-gp)*30}px)`;gUsed.style.opacity=clamp(gp*2);
+  const cnt=E(t,15.05,15.9,'outExpo');gBig.textContent=(812.6*cnt).toFixed(1)+' GB';gBar.firstChild.style.width=(87.7*cnt)+'%';gBig.textContent=(812.6*cnt).toFixed(1);
+  const ip=E(t,15.25,15.7,'outBack2');gInbox.style.transform=`scale(${ip}) translateY(${(1-ip)*-30}px)`;gInbox.style.opacity=clamp(ip*2);gInbox.lastChild.firstChild.style.width=(95*E(t,15.4,16.0,'outExpo'))+'%';
+  const tp2=E(t,15.6,16.0,'outBack2');gTip.style.transform=`scale(${tp2})`;gTip.style.opacity=clamp(tp2*2);
+ }
+ /* S6 pillars */
+ P6.forEach((p,i)=>{const t0=P6t[i],t1=P6t[i+1];if(show(p.el,t>=t0&&t<(i==2?19.2:99))){
+  const w=E(t,t0,t0+.28,'io3');const f=p.from;p.el.style.clipPath=f=='right'?`inset(0 0 0 ${(1-w)*100}%)`:f=='left'?`inset(0 ${(1-w)*100}% 0 0)`:`inset(0 0 ${(1-w)*100}% 0)`;
+  ktA(p.k1,t,t0+.1,null,{stag:.03,dur:.4,e:'outBack2'});ktA(p.k2,t,t0+.18,null,{stag:.03,dur:.4,e:'outBack2'});ktA(p.sub,t,t0+.3,null,{stag:.008,dur:.3});
+  T(p.icn,0,Math.sin((t-t0)*5)*8,E(t,t0+.1,t0+.45,'outBack2'),(1-E(t,t0+.1,t0+.5,'outElastic'))*-40,1);
+  p.el.firstChild&&0}});
+ /* S7 outro */
+ if(show(S7,t>=19.15)){
+  const w=E(t,19.15,19.55,'io3');S7.style.clipPath=`circle(${w*1400}px at 960px 540px)`;
+  const lp=E(t,19.35,20.0,'outBack2');oLogo.style.transform=`scale(${lp}) rotate(${(1-E(t,19.35,20.25,'outElastic'))*-20}deg) translateY(${Math.sin((t-20.0)*3)*(t>20.0?7:0)}px)`;
+  oShine.style.backgroundSize='300% 100%';oShine.style.backgroundPosition=`${-300+E(t,20.0,20.65,'io3')*600}px 0`;
+  ktA(oTidy,t,19.5,null,{stag:.07,dur:.7,e:'outBack2',rot:6});
+  oTag.forEach((k,i)=>ktA(k,t,20.1+i*.4,null,{stag:.02,dur:.5}));
+  oPills.style.opacity=E(t,20.3,20.65);oPills.style.transform=`translateY(${(1-E(t,20.3,20.7,'outExpo'))*40}px)`;
+  oUrl.style.opacity=E(t,20.5,20.85);
+ }
+ oWipe.style.display='none';
+ updBars(t);
+ /* final fade */
+ stage.style.opacity=1-E(t,23.7,24.4,'io3');
+}
+window.seek=seek;seek(0);
+</script></body></html>

@@ -209,6 +209,9 @@ impl Journal {
                 .map(|p| p.to_string_lossy().to_string());
             let size = action.original_size() as i64;
             let modified = match action {
+                ValidatedAction::CreateDir { .. }
+                | ValidatedAction::MoveDir { .. }
+                | ValidatedAction::Restore { .. } => 0,
                 ValidatedAction::Move {
                     original_modified, ..
                 }

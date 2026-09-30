@@ -13,15 +13,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tidy-organization = { path = "../organization" }
 tidy-storage = { path = "../storage" }
 
-[[bin]]
-name = "tidy-ai"
-path = "src/main.rs"
-
 [dev-dependencies]
 tidy-file-indexer = { path = "../file-indexer" }
 tidy-platform = { path = "../platform" }
+tidy-safety = { path = "../safety" }
 
 [[test]]
 name = "phase4_contract"
 path = "../../tests/phase4_contract.rs"
 
+
+[[test]]
+name = "e2e_mock_folder"
+path = "../../tests/e2e_mock_folder.rs"
+
+[[test]]
+name = "e2e_large_scale"
+path = "../../tests/e2e_large_scale.rs"

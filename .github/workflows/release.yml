@@ -1,0 +1,102 @@
+name: Release
+
+# Publishes a GitHub Release when a version tag is pushed:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v1.0.0"
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build, verify and publish (macOS, Apple Silicon)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write        # create the release
+      id-token: write        # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: target/native
+          key: worker-${{ runner.os }}-${{ hashFiles('scripts/build-worker.mjs', 'native/inference/**') }}
+
+      - name: The tag must match the app version
+        run: node scripts/check-version.mjs "$TAG"
+
+      - name: Front end
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npx tsc -b
+          npm run build
+      - name: Gate on the full test suite
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - run: brew install cmake
+      - name: Build the local-AI worker and the release bundle
+        working-directory: apps/desktop
+        run: |
+          npm run worker:build
+          npm run package
+
+      - name: Sign (ad-hoc) and verify the bundle
+        run: |
+          APP=target/release/bundle/macos/Tidy.app
+          codesign --force --deep --sign - "$APP"
+          REQUIRE_SIGNATURE=1 scripts/verify-bundle.sh "$APP"
+
+      - name: Package (dmg + zip + checksums)
+        run: |
+          VERSION="${TAG#v}"
+          mkdir dist-release
+          scripts/make-dmg.sh target/release/bundle/macos/Tidy.app "dist-release/Tidy-${VERSION}-macos-arm64.dmg"
+          ditto -c -k --keepParent target/release/bundle/macos/Tidy.app "dist-release/Tidy-${VERSION}-macos-arm64.zip"
+          (cd dist-release && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          node scripts/release-notes.mjs "$VERSION" > release-notes.md
+          {
+            echo
+            echo "### Install"
+            echo "Download the \`.dmg\`, drag **Tidy** to Applications. Builds are not notarized: on first launch right-click → **Open**, or run \`xattr -dr com.apple.quarantine /Applications/Tidy.app\`."
+            echo
+            echo "Verify the download: \`shasum -a 256 -c SHA256SUMS.txt\`. Requires macOS 11+; Apple Silicon recommended for local AI."
+          } >> release-notes.md
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist-release/*
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Tidy ${{ env.TAG }}
+          body_path: release-notes.md
+          files: dist-release/*
+          prerelease: ${{ contains(env.TAG, '-') }}
+          fail_on_unmatched_files: true

@@ -10,7 +10,8 @@ use std::{
 pub struct AuthorizedRoot(PathBuf, #[cfg(unix)] (u64, u64));
 impl AuthorizedRoot {
     pub fn authorize(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
+        let path = strip_data_volume(path.as_ref());
+        let path = path.as_path();
         if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(denied("select an absolute path without parent traversal"));
         }
@@ -18,11 +19,6 @@ impl AuthorizedRoot {
         let canonical = fs::canonicalize(path).map_err(|e| io_context("resolve path", path, e))?;
         if !canonical.is_dir() || protected(&canonical) {
             return Err(denied("protected path or not a directory"));
-        }
-        for ancestor in canonical.ancestors() {
-            if git_marker(ancestor)? {
-                return Err(denied("Git repository boundary"));
-            }
         }
         #[cfg(unix)]
         {
@@ -53,13 +49,18 @@ impl AuthorizedRoot {
         {
             return Err(denied("resolved path outside scope"));
         }
-        // Recheck ancestors, including repositories created after authorization.
-        for ancestor in path.ancestors() {
-            if git_marker(ancestor)? {
-                return Err(denied("Git repository boundary"));
-            }
-        }
         Ok(())
+    }
+}
+/// The user's files live on the Data volume, mounted at `/System/Volumes/Data` and also visible at
+/// `/`. The two names are the same folder; use the everyday one so the system-path rules don't
+/// mistake a home folder for a system folder.
+pub fn strip_data_volume(path: &Path) -> PathBuf {
+    match path.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) if !rest.as_os_str().is_empty() && Path::new("/").join(rest).exists() => {
+            Path::new("/").join(rest)
+        }
+        _ => path.to_path_buf(),
     }
 }
 fn denied(message: &str) -> io::Error {
@@ -111,10 +112,14 @@ pub fn protected(path: &Path) -> bool {
         for root in [
             "/System",
             "/Library",
-            "/Applications",
             "/bin",
             "/sbin",
-            "/usr",
+            "/usr/bin",
+            "/usr/lib",
+            "/usr/libexec",
+            "/usr/sbin",
+            "/usr/share",
+            "/usr/standalone",
             "/etc",
             "/private/etc",
             "/private/var",
@@ -157,13 +162,84 @@ pub fn protected(path: &Path) -> bool {
             }
         }
     }
-    path.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
+    let names: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if names.iter().any(|name| {
         matches!(
-            name.as_ref(),
+            name.as_str(),
             ".git" | ".ssh" | ".gnupg" | ".Trash" | ".Trashes"
-        ) || cfg!(target_os = "macos") && name == "Library"
-    })
+        )
+    }) {
+        return true;
+    }
+    // A user's own Library holds app data and credentials. Only its cache, log, developer and
+    // application-support areas may be managed; a folder merely named "Library" elsewhere is fine.
+    if cfg!(target_os = "macos")
+        && let Some(at) = names.iter().position(|n| n == "Library")
+        && at >= 2
+        && names[at - 2] == "Users"
+    {
+        return !matches!(
+            names.get(at + 1).map(String::as_str),
+            Some(
+                "Caches"
+                    | "Logs"
+                    | "Developer"
+                    | "Application Support"
+                    | "Containers"
+                    | "Group Containers"
+                    | "Saved Application State"
+            )
+        ) || names.len() == at + 2 && names[at + 1] == "Application Support";
+    }
+    false
+}
+
+/// Plain-language reason a folder cannot be managed, for the UI (never a raw error code).
+pub fn explain_refusal(path: &Path) -> String {
+    let path = strip_data_volume(path);
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    if !path.is_dir() {
+        return format!("“{name}” isn't a folder Tidy can open.");
+    }
+    if protected(&path) {
+        let what = if path.starts_with("/System")
+            || path.starts_with("/Library")
+            || path.starts_with("/bin")
+            || path.starts_with("/sbin")
+            || path.starts_with("/usr/bin")
+            || path.starts_with("/private")
+        {
+            "macOS system files"
+        } else if path.components().any(|c| c.as_os_str() == "Library") {
+            "your Library folder (app data, keychains, mail, settings)"
+        } else if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some(".ssh" | ".gnupg")))
+        {
+            "credentials and keys"
+        } else if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
+        {
+            "the Trash"
+        } else if path.components().any(|c| c.as_os_str() == ".git") {
+            "Git's internal data"
+        } else {
+            "an external or system volume"
+        };
+        return format!(
+            "Tidy won't manage “{name}”: it contains {what}, and Tidy never changes those so a request can't damage your Mac. You can still see its size and open it in Finder. Full Disk Access only lets macOS *show* protected folders; it doesn't change this safety rule. Subfolders such as ~/Library/Caches or ~/Library/Application Support/<app> can be managed."
+        );
+    }
+    format!(
+        "Tidy couldn't open “{name}”. Check that it exists and that Tidy has permission (System Settings → Privacy & Security → Full Disk Access)."
+    )
 }
 
 /// Adds operation/path context while retaining the original OS error as a source.
@@ -260,5 +336,62 @@ pub fn volume_space(path: &Path) -> io::Result<Option<VolumeSpace>> {
     {
         let _ = path;
         Ok(None)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_policy_tests {
+    use super::*;
+    fn ok(p: &str) -> bool {
+        !Path::new(p).exists() || AuthorizedRoot::authorize(p).is_ok()
+    }
+    #[test]
+    fn everyday_folders_are_manageable_and_system_ones_are_not() {
+        let home = std::env::var("HOME").unwrap();
+        for p in [
+            "/Users/Shared",
+            "/Applications",
+            "/opt",
+            "/usr/local",
+            &home,
+            &format!("{home}/Library/Caches"),
+        ] {
+            assert!(ok(p), "{p} should be manageable");
+        }
+        for p in [
+            "/System",
+            "/Library",
+            "/usr/bin",
+            "/bin",
+            &format!("{home}/Library"),
+            &format!("{home}/.ssh"),
+            "/Volumes",
+        ] {
+            if Path::new(p).exists() {
+                assert!(
+                    AuthorizedRoot::authorize(p).is_err(),
+                    "{p} must stay protected"
+                );
+            }
+        }
+    }
+    #[test]
+    fn the_data_volume_path_is_the_same_folder_as_the_everyday_path() {
+        if Path::new("/System/Volumes/Data/Users/Shared").exists() {
+            let root = AuthorizedRoot::authorize("/System/Volumes/Data/Users/Shared").unwrap();
+            assert_eq!(root.path(), Path::new("/Users/Shared"));
+        }
+    }
+    #[test]
+    fn refusals_are_explained_in_plain_language() {
+        let home = std::env::var("HOME").unwrap();
+        let text = explain_refusal(Path::new(&format!("{home}/Library")));
+        assert!(
+            text.contains("Library")
+                && text.contains("Full Disk Access")
+                && text.contains("Caches"),
+            "{text}"
+        );
+        assert!(explain_refusal(Path::new("/System")).contains("macOS system files"));
     }
 }

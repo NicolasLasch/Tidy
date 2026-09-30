@@ -43,6 +43,15 @@ pub enum ProposedAction {
         source: FileId,
         mode: u32,
     },
+    /// Creates an absent folder (and any absent parents) inside the authorized root.
+    CreateFolder {
+        path: PathBuf,
+    },
+    /// Moves or renames a whole folder without replacing anything.
+    MoveFolder {
+        source: PathBuf,
+        destination_relative: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +86,9 @@ fn extension_category(ext: &str) -> Option<&'static str> {
         "xls" | "xlsx" | "csv" | "tsv" | "numbers" | "ods" => Some("Spreadsheets"),
         "ppt" | "pptx" | "key" | "odp" => Some("Presentations"),
         "figma" | "sketch" | "ai" | "psd" | "xd" => Some("Design"),
+        "dmg" | "pkg" | "iso" | "exe" | "msi" | "deb" | "apk" => Some("Installers"),
+        "log" => Some("Logs"),
+        "tmp" | "bak" | "part" | "crdownload" | "swp" | "old" => Some("Temporary"),
         _ => None,
     }
 }
@@ -89,7 +101,7 @@ pub fn civil_from_unix_seconds(seconds: i64) -> Option<(i32, u32, u32)> {
     let z = days + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
     let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1024 + doe / 1461 - doe / 142408) / 365;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -99,6 +111,25 @@ pub fn civil_from_unix_seconds(seconds: i64) -> Option<(i32, u32, u32)> {
     Some((y as i32, m, d))
 }
 
+#[cfg(test)]
+mod calendar_tests {
+    use super::civil_from_unix_seconds;
+    #[test]
+    fn civil_dates_match_known_calendar_days() {
+        // (unix seconds at noon UTC, y, m, d)
+        for (t, y, m, d) in [
+            (86_400 + 43_200, 1970, 1, 2),
+            (951_782_400 + 43_200, 2000, 2, 29),
+            (1_709_208_000, 2024, 2, 29),
+            (1_735_732_800, 2025, 1, 1),
+            (1_790_000_000, 2026, 9, 21),
+            (1_798_675_200, 2026, 12, 31),
+            (4_102_401_600, 2099, 12, 31),
+        ] {
+            assert_eq!(civil_from_unix_seconds(t), Some((y, m, d)), "{t}");
+        }
+    }
+}
 fn path_contains_git(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".git")
 }

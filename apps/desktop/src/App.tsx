@@ -1,22 +1,18 @@
-import LocalAi from "./LocalAi";
-import HistoryJournal from "./HistoryJournal";
-import ChatView, { size } from "./ChatView";
+import ModelView, { type AiStatus } from "./ModelView";
+import { version } from "../package.json";
+import HistoryView from "./HistoryView";
+import ChatView from "./ChatView";
 import StorageView from "./StorageView";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
-  ArrowDownWideNarrow,
   Cpu,
-  File,
   Folder,
   History,
   LoaderCircle,
   MessageCircle,
   Minimize2,
   Maximize2,
-  RefreshCw,
-  Search,
-  Sparkles,
   X,
   HardDrive,
 } from "lucide-react";
@@ -31,21 +27,13 @@ type Scope = {
   omitted: number;
   content: boolean;
 };
-type FileRow = {
-  id: number;
-  path: string;
-  size: number;
-  modified: number;
-  excerpt: string | null;
-  hashed: boolean;
-};
 type Job = {
   running: boolean;
   scope_id: number | null;
   visited: number;
   message: string;
 };
-type Tab = "chat" | "storage" | "files" | "history" | "ai";
+type Tab = "chat" | "storage" | "history" | "ai";
 const emptyJob: Job = { running: false, scope_id: null, visited: 0, message: "" };
 const basename = (path: string) =>
   path.split(/[\\/]/).filter(Boolean).at(-1) || path;
@@ -55,12 +43,12 @@ export default function App() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [tab, setTab] = useState<Tab>("chat");
   const [compact, setCompact] = useState(false);
-  const [baseId, setBaseId] = useState<number | null>(null);
   const [chatId, setChatId] = useState<number | null>(null);
   const [job, setJob] = useState<Job>(emptyJob);
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const [prompt, setPrompt] = useState<string | null>(null);
+  const [ai, setAi] = useState<AiStatus | null>(null);
   const lastRunning = useRef(false);
 
   async function refresh() {
@@ -70,13 +58,6 @@ export default function App() {
     ]);
     setScopes(list);
     setSelected(new Set(ids));
-    setBaseId((b) =>
-      b !== null && list.some((s) => s.id === b)
-        ? b
-        : (list
-            .filter((s) => !list.some((o) => o.id !== s.id && s.path.startsWith(o.path + "/")))
-            .sort((a, b) => b.bytes - a.bytes)[0]?.id ?? null),
-    );
   }
   useEffect(() => {
     if (!isTauri()) {
@@ -99,6 +80,10 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  const loadModels = () => void invoke<AiStatus>("ai_status").then(setAi).catch(() => {});
+  useEffect(() => {
+    if (isTauri()) loadModels();
+  }, [tab]);
   const chatScopes = useMemo(
     () =>
       scopes
@@ -114,6 +99,13 @@ export default function App() {
     );
   }, [chatScopes]);
 
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && compact && !document.querySelector('[aria-modal="true"]')) void setCompactMode(false);
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  });
   async function setCompactMode(next: boolean) {
     try {
       await invoke("set_compact_mode", { compact: next });
@@ -129,19 +121,6 @@ export default function App() {
     lastRunning.current = true;
     setJob({ ...emptyJob, running: true, scope_id: id, message: "Reading folder…" });
   }
-  async function add() {
-    try {
-      const id = await invoke<number | null>("choose_folder");
-      if (id !== null) {
-        await refresh();
-        setBaseId(id);
-        setTab("storage");
-        await scan(id);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
-  }
   async function toggleBase(id: number, on: boolean) {
     try {
       setSelected(new Set(await invoke<number[]>("set_ai_selected", { scopeId: id, selected: on })));
@@ -149,44 +128,33 @@ export default function App() {
       setError(String(e));
     }
   }
-  async function toggleFolder(
-    base: number,
-    path: string,
-    scopeId: number | null,
-    on: boolean,
-  ) {
-    if (scopeId !== null) {
-      setSelected(new Set(await invoke<number[]>("set_ai_selected", { scopeId, selected: on })));
-      return;
-    }
-    if (!on) return;
-    if (job.running) throw new Error("Wait for the current scan to finish, then try again.");
-    const id = await invoke<number>("use_working_folder", { scopeId: base, parent: path });
+  async function pickFolder() {
+    const id = await invoke<number | null>("choose_folder");
+    if (id === null) return;
     await invoke<number[]>("set_ai_selected", { scopeId: id, selected: true });
     await refresh();
+    setChatId(id);
+    await scan(id);
+  }
+  async function authorize(path: string) {
+    if (job.running) throw new Error("Wait for the current scan to finish, then try again.");
+    const id = await invoke<number>("authorize_path", { path });
+    await invoke<number[]>("set_ai_selected", { scopeId: id, selected: true });
+    await refresh();
+    setChatId(id);
     await scan(id);
   }
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "chat", label: "Chat", icon: <MessageCircle size={22} /> },
     { id: "storage", label: "Storage", icon: <HardDrive size={22} /> },
-    { id: "files", label: "Files", icon: <File size={22} /> },
     { id: "history", label: "History", icon: <History size={22} /> },
     { id: "ai", label: "AI", icon: <Cpu size={22} /> },
   ];
   const chatScope = scopes.find((s) => s.id === chatId);
-  const base = scopes.find((s) => s.id === baseId);
   const scanningNow = job.running;
-
-  return (
-    <div className={`x-app ${compact ? "compact" : ""}`}>
-      <header className="x-top" data-tauri-drag-region>
-        <div className="x-top-left" data-tauri-drag-region>
-          <span className="x-logo">
-            <Sparkles size={15} />
-          </span>
-          <strong data-tauri-drag-region>Tidy</strong>
-        </div>
+  const pickers = (
+    <>
         {tab === "chat" && chatScopes.length > 0 && (
           <label className="x-scope-pick">
             <Folder size={14} />
@@ -203,11 +171,46 @@ export default function App() {
             </select>
           </label>
         )}
+        {tab === "chat" && ai && (
+          <label className="x-scope-pick x-model-pick" title="The AI model used when a request needs one">
+            <Cpu size={14} />
+            <select
+              value={ai.selected ?? ""}
+              aria-label="AI model"
+              onChange={(e) => {
+                if (e.target.value === "__manage") {
+                  if (compact) void setCompactMode(false);
+                  setTab("ai");
+                } else {
+                  void invoke("ai_select_model", { modelId: e.target.value }).then(loadModels).catch((x) => setError(String(x)));
+                }
+              }}
+            >
+              {!ai.selected && <option value="">No model · instant only</option>}
+              {ai.models.filter((m) => m.installed).map((m) => (
+                <option key={m.spec.id} value={m.spec.id}>{m.spec.name.replace(" (recommended)", "")}</option>
+              ))}
+              <option value="__manage">Add or download models…</option>
+            </select>
+          </label>
+        )}
+    </>
+  );
+
+  return (
+    <div className={`x-app ${compact ? "compact" : ""}`}>
+      <header className="x-top" data-tauri-drag-region>
+        <div className="x-top-left" data-tauri-drag-region>
+          <img className="x-logo" src="/logo.png" alt="" />
+          <strong data-tauri-drag-region>Tidy</strong>
+        </div>
+        <span className="x-pickers-top">{pickers}</span>
         <div className="x-top-right">
           {scanningNow && (
             <span className="x-scanning">
               <LoaderCircle size={13} className="x-spin" />
               {job.visited.toLocaleString()}
+              <button className="x-link" onClick={() => void invoke("cancel_scan")}>Stop</button>
             </span>
           )}
           <button
@@ -228,6 +231,7 @@ export default function App() {
           </button>
         </div>
       )}
+      {tab === "chat" && <div className="x-subbar">{pickers}</div>}
       <main className="x-main">
         <div hidden={tab !== "chat"} className="x-fill">
           <ChatView
@@ -253,15 +257,12 @@ export default function App() {
               name: basename(s.path),
               files: s.files,
               bytes: s.bytes,
-              status: s.status,
             }))}
-            baseId={baseId}
-            onBase={setBaseId}
             selected={selected}
-            onToggleBase={(id: number, on: boolean) => void toggleBase(id, on)}
-            onToggleFolder={toggleFolder}
-            onAdd={() => void add()}
-            onAsk={(text: string, id: number) => {
+            onToggleScope={async (id, on) => void (await toggleBase(id, on))}
+            onAuthorize={authorize}
+            onPick={pickFolder}
+            onAsk={(text, id) => {
               if (!selected.has(id)) {
                 setError("Switch this folder on first so Tidy is allowed to work in it.");
                 return;
@@ -278,39 +279,31 @@ export default function App() {
             }}
           />
         )}
-        {tab === "files" && (
-          <FilesView
-            scope={base ?? null}
-            scopes={scopes.filter(
-              (s) => !scopes.some((o) => o.id !== s.id && s.path.startsWith(o.path + "/")),
-            )}
-            onBase={setBaseId}
-            revision={revision}
-            scanning={scanningNow}
-            onRescan={(content) => base && void scan(base.id, content).catch((e) => setError(String(e)))}
+        {tab === "history" && (
+          <HistoryView
+            scopes={scopes.map((s) => ({ id: s.id, path: s.path, name: basename(s.path) }))}
+            onRescan={(id) => void scan(id).catch((e) => setError(String(e)))}
+            refreshKey={revision}
+            onChanged={() => {
+              setRevision((r) => r + 1);
+              void refresh();
+            }}
           />
         )}
-        {tab === "history" && (
-          <div className="x-page legacy">
-            {base ? (
-              <HistoryJournal
-                key={`history-${baseId}`}
-                scopeId={base.id}
-                scopeName={basename(base.path)}
-                onRefreshNeeded={() => setRevision((r) => r + 1)}
-              />
-            ) : (
-              <p className="x-note">Nothing here yet.</p>
-            )}
-          </div>
-        )}
         {tab === "ai" && (
-          <div className="x-page legacy">
-            <LocalAi scopeId={chatId} />
-          </div>
+          <ModelView
+            onChanged={loadModels}
+            folders={scopes.map((s) => ({ id: s.id, path: s.path, files: s.files }))}
+            selected={selected}
+            onForget={async (id) => {
+              await invoke("forget_folder", { scopeId: id });
+              await refresh();
+              setRevision((r) => r + 1);
+            }}
+          />
         )}
       </main>
-      {!compact && (
+      {(
         <nav className="x-tabbar" aria-label="Sections">
           {tabs.map((t) => (
             <button
@@ -323,127 +316,8 @@ export default function App() {
               <span>{t.label}</span>
             </button>
           ))}
-          <span className="x-version">v0.8.2{chatScope ? ` · ${basename(chatScope.path)}` : ""}</span>
+          <span className="x-version">v{version}{chatScope ? ` · ${basename(chatScope.path)}` : ""}</span>
         </nav>
-      )}
-    </div>
-  );
-}
-
-function FilesView({
-  scope,
-  scopes,
-  onBase,
-  revision,
-  scanning,
-  onRescan,
-}: {
-  scope: Scope | null;
-  scopes: Scope[];
-  onBase: (id: number) => void;
-  revision: number;
-  scanning: boolean;
-  onRescan: (content: boolean) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [bySize, setBySize] = useState(true);
-  const [offset, setOffset] = useState(0);
-  const [page, setPage] = useState<{ files: FileRow[]; total: number }>({ files: [], total: 0 });
-  const [loading, setLoading] = useState(false);
-  const [open, setOpen] = useState<FileRow | null>(null);
-  const [content, setContent] = useState(false);
-  const id = scope?.id ?? null;
-  useEffect(() => setOffset(0), [id, query, bySize]);
-  useEffect(() => {
-    if (id === null) return;
-    let live = true;
-    setLoading(true);
-    const t = setTimeout(() => {
-      invoke<{ files: FileRow[]; total: number }>("search_files", {
-        scopeId: id,
-        query,
-        sizeSort: bySize,
-        offset,
-      })
-        .then((r) => live && setPage(r))
-        .catch(() => {})
-        .finally(() => live && setLoading(false));
-    }, 180);
-    return () => {
-      live = false;
-      clearTimeout(t);
-    };
-  }, [id, query, bySize, offset, revision]);
-  if (!scope) return <div className="x-page"><p className="x-note">Add a folder in Folders first.</p></div>;
-  return (
-    <div className="x-page">
-      <div className="x-large-title">
-        <div>
-          <h1>Files</h1>
-          <p>
-            {scope.files.toLocaleString()} indexed · {size(scope.bytes)} ·{" "}
-            {scope.scanned_at ? `scanned ${new Date(scope.scanned_at * 1000).toLocaleString()}` : "not scanned"}
-          </p>
-        </div>
-        <button className="x-pill" disabled={scanning} onClick={() => onRescan(content)}>
-          <RefreshCw size={15} /> Rescan
-        </button>
-      </div>
-      <div className="x-segment">
-        {scopes.map((s) => (
-          <button key={s.id} className={s.id === id ? "on" : ""} onClick={() => onBase(s.id)}>
-            {basename(s.path)}
-          </button>
-        ))}
-      </div>
-      <label className="x-search">
-        <Search size={15} />
-        <input placeholder="Search names and text" value={query} maxLength={100} onChange={(e) => setQuery(e.target.value)} />
-        <button type="button" className="x-sort" onClick={() => setBySize(!bySize)}>
-          <ArrowDownWideNarrow size={14} /> {bySize ? "Largest" : "A–Z"}
-        </button>
-      </label>
-      <label className="x-check">
-        <input type="checkbox" checked={content} disabled={scanning} onChange={(e) => setContent(e.target.checked)} />
-        Also read text inside files on the next rescan (stored locally)
-      </label>
-      <div className="x-group">
-        {page.files.map((f) => (
-          <button key={f.id} className="x-file-row" onClick={() => setOpen(f)}>
-            <File size={18} />
-            <span>
-              <b>{basename(f.path)}</b>
-              <small>{f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "top level"}</small>
-            </span>
-            <em>{size(f.size)}</em>
-          </button>
-        ))}
-        {!page.files.length && (
-          <p className="x-note">{loading ? "Loading…" : query ? "No matches." : "Nothing indexed yet."}</p>
-        )}
-      </div>
-      {page.total > 100 && (
-        <div className="x-pager">
-          <button disabled={!offset} onClick={() => setOffset(Math.max(0, offset - 100))}>Previous</button>
-          <span>{offset + 1}–{Math.min(offset + 100, page.total)} of {page.total.toLocaleString()}</span>
-          <button disabled={offset + 100 >= page.total} onClick={() => setOffset(offset + 100)}>Next</button>
-        </div>
-      )}
-      {open && (
-        <div className="x-sheet-backdrop" onClick={() => setOpen(null)}>
-          <section className="x-sheet" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
-            <div className="x-grabber" />
-            <h3>{basename(open.path)}</h3>
-            <p>{open.path}</p>
-            <div className="x-sheet-list">
-              <div><span><b>{size(open.size)}</b><small>{open.hashed ? "SHA-256 indexed" : "Not hashed"}</small></span></div>
-              {open.excerpt && <pre>{open.excerpt}</pre>}
-            </div>
-            <div className="x-sheet-buttons">
-              <button className="x-secondary" onClick={() => setOpen(null)}>Close</button>
-            </div>
-          </section>
-        </div>
       )}
     </div>
   );

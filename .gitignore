@@ -13,3 +13,9 @@ apps/desktop/src-tauri/resources/inference/tidy-inference-worker*
 !.env.example
 .idea/
 .vscode/
+
+# Generated mock data for manual trials
+/mock-data/
+
+# Promo video render output (large; regenerate with promo/render.mjs)
+/promo/out/

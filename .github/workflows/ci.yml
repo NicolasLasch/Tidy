@@ -1,82 +1,107 @@
-name: CI - Build & Test
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  core:
-    name: Core Workspace (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+permissions:
+  contents: read
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  versions:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-version.mjs
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Format, lint, test (macOS)
+    # The safety engine, disk explorer and end-to-end scenarios target macOS.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Fetch dependencies
-        run: cargo fetch --locked
-
-      - name: Verify code formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run unit & contract tests (offline verification)
-        run: cargo test --locked --offline
-
-      - name: Run Clippy checks with zero warnings
-        run: cargo clippy --all-targets --locked --offline -- -D warnings
-
-  desktop:
-    name: Desktop App & Tauri Bundle (macOS)
-    runs-on: macos-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
-
-      - name: Install frontend dependencies
+      - name: Front end (type-check and build; Tauri needs dist/)
         working-directory: apps/desktop
-        run: npm ci
+        run: |
+          npm ci
+          npx tsc -b
+          npm run build
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests (unit, contract, end-to-end on mock data)
+        run: cargo test --workspace --locked
 
-      - name: Build frontend application (TypeScript & Vite)
+  package:
+    name: Build the app bundle (macOS)
+    # Proves the full pipeline (local-AI worker + app bundle) works, without publishing anything.
+    if: github.event_name != 'pull_request'
+    needs: [test]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: target/native
+          key: worker-${{ runner.os }}-${{ hashFiles('scripts/build-worker.mjs', 'native/inference/**') }}
+      - run: brew install cmake
+      - name: Build the pinned worker and the app
         working-directory: apps/desktop
-        run: npm run build
-
-      - name: Build pinned native inference worker
-        working-directory: apps/desktop
-        run: npm run worker:build
-
-      - name: Fetch Rust dependencies
-        run: cargo fetch --locked
-
-      - name: Clippy check on full workspace
-        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-
-      - name: Build Tauri desktop development bundle
-        working-directory: apps/desktop
-        run: npm run tauri -- build --debug --bundles app
+        run: |
+          npm ci
+          npm run worker:build
+          npm run tauri -- build --debug --bundles app
+      - name: Verify the bundle
+        run: |
+          APP=target/debug/bundle/macos/Tidy.app
+          codesign --force --deep --sign - "$APP"
+          REQUIRE_SIGNATURE=1 scripts/verify-bundle.sh "$APP"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tidy-debug-macos
+          path: target/debug/bundle/macos/Tidy.app
+          retention-days: 7

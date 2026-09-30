@@ -24,6 +24,9 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 fn single(name: &OsStr) -> io::Result<()> {
+    if name == ".git" {
+        return Err(refusal("Git internals are never opened or changed"));
+    }
     let mut parts = Path::new(name).components();
     if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
         return Err(refusal("expected a single filename"));
@@ -102,12 +105,10 @@ impl Directory {
         stat.st_dev as u64 == self.device
     }
 }
-fn reject_git(fd: &OwnedFd) -> io::Result<()> {
-    match fs::statat(fd, ".git", AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Err(refusal("Git repository boundary")),
-        Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(error(e)),
-    }
+/// Repositories are ordinary folders now; only the `.git` directory itself is off limits, which
+/// `single` enforces for every handle-relative operation.
+fn reject_git(_fd: &OwnedFd) -> io::Result<()> {
+    Ok(())
 }
 pub fn regular(stat: &Stat) -> bool {
     fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::RegularFile
@@ -219,8 +220,8 @@ pub fn inspect_tree(root: &AuthorizedRoot, relative: &Path) -> io::Result<(Stat,
     };
     let first = parent.child(&name, &top)?;
     let entries = first.entries()?;
-    let mut stack = vec![(first, entries)];
-    while let Some((dir, entries)) = stack.last_mut() {
+    let mut stack = vec![(first, entries, root.path().join(relative))];
+    while let Some((dir, entries, here)) = stack.last_mut() {
         let Some(entry) = entries.next() else {
             stack.pop();
             continue;
@@ -234,12 +235,21 @@ pub fn inspect_tree(root: &AuthorizedRoot, relative: &Path) -> io::Result<(Stat,
             return Err(refusal("folder has too many entries for one Trash action"));
         }
         let child_name = OsStr::from_bytes(raw);
+        if raw == b".git" {
+            // Moved as part of the folder, never opened through handles: measure it read-only.
+            let git = plain_tree_size(&here.join(child_name));
+            summary.dirs += 1 + git.1;
+            summary.files += git.0;
+            summary.bytes += git.2;
+            continue;
+        }
         let stat = dir.stat(child_name)?;
         if directory(&stat) {
             summary.dirs += 1;
             let child = dir.child(child_name, &stat)?;
             let child_entries = child.entries()?;
-            stack.push((child, child_entries));
+            let below = here.join(child_name);
+            stack.push((child, child_entries, below));
         } else {
             summary.files += 1;
             if regular(&stat) {
@@ -249,6 +259,30 @@ pub fn inspect_tree(root: &AuthorizedRoot, relative: &Path) -> io::Result<(Stat,
     }
     Ok((top, summary))
 }
+/// Read-only, no-follow totals for a tree that handles never open (the `.git` directory).
+fn plain_tree_size(path: &Path) -> (u64, u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let (mut files, mut dirs, mut bytes) = (0, 0, 0);
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                dirs += 1;
+                stack.push(entry.path());
+            } else {
+                files += 1;
+                bytes += meta.size();
+            }
+        }
+    }
+    (files, dirs, bytes)
+}
 /// Fingerprint of a directory and everything below it: identity plus entry and byte totals.
 pub fn dir_fingerprint_relative(root: &AuthorizedRoot, relative: &Path) -> io::Result<String> {
     let (top, tree) = inspect_tree(root, relative)?;
@@ -256,6 +290,48 @@ pub fn dir_fingerprint_relative(root: &AuthorizedRoot, relative: &Path) -> io::R
         "dir:{}:{}:{}:{}:{}",
         top.st_dev, top.st_ino, tree.files, tree.dirs, tree.bytes
     ))
+}
+/// Creates one absent folder (and absent parents); never reuses an existing entry.
+pub fn create_dir_no_replace(root: &AuthorizedRoot, relative: &Path) -> io::Result<String> {
+    if crate::protected(&root.path().join(relative)) {
+        return Err(refusal("protected destination"));
+    }
+    let (parent, name) = parent_for(root, relative, true)?;
+    reject_git(&parent.fd)?;
+    fs::mkdirat(&parent.fd, &name, Mode::from_raw_mode(0o755)).map_err(error)?;
+    fs::fsync(&parent.fd).map_err(error)?;
+    dir_fingerprint_relative(root, relative)
+}
+/// Atomic no-replace rename of a whole folder. The tree must still match the reviewed fingerprint.
+pub fn move_dir_no_replace(
+    root: &AuthorizedRoot,
+    source: &Path,
+    destination: &Path,
+    expected: &str,
+) -> io::Result<String> {
+    if destination.starts_with(source) {
+        return Err(refusal("a folder cannot move into itself"));
+    }
+    if crate::protected(&root.path().join(destination)) {
+        return Err(refusal("protected destination"));
+    }
+    if dir_fingerprint_relative(root, source)? != expected {
+        return Err(refusal("folder changed since approval"));
+    }
+    let (from, name) = parent_for(root, source, false)?;
+    let before = from.stat(&name)?;
+    let (to, target) = parent_for(root, destination, true)?;
+    reject_git(&from.fd)?;
+    reject_git(&to.fd)?;
+    fs::renameat_with(&from.fd, &name, &to.fd, &target, fs::RenameFlags::NOREPLACE)
+        .map_err(error)?;
+    let after = to.stat(&target)?;
+    if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
+        return Err(refusal("moved folder changed; recovery required"));
+    }
+    fs::fsync(&from.fd).map_err(error)?;
+    fs::fsync(&to.fd).map_err(error)?;
+    dir_fingerprint_relative(root, destination)
 }
 /// Atomic no-replace rename; never falls back to overwrite or copy-and-delete.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -280,8 +356,20 @@ pub fn move_no_replace(
     if stamp(&from.stat(&name)?) != expected {
         return Err(refusal("source changed before move"));
     }
-    fs::renameat_with(&from.fd, &name, &to.fd, &target, fs::RenameFlags::NOREPLACE)
-        .map_err(error)?;
+    // A case-only rename of the same file (same directory, same inode, names equal ignoring case)
+    // cannot use the no-replace flag on case-insensitive volumes: the destination "exists".
+    let case_only = to
+        .stat(&target)
+        .is_ok_and(|existing| existing.st_dev == before.st_dev && existing.st_ino == before.st_ino)
+        && name.to_string_lossy().to_lowercase() == target.to_string_lossy().to_lowercase()
+        && name != target
+        && fs::fstat(&from.fd).map_err(error)?.st_ino == fs::fstat(&to.fd).map_err(error)?.st_ino;
+    if case_only {
+        fs::renameat(&from.fd, &name, &to.fd, &target).map_err(error)?;
+    } else {
+        fs::renameat_with(&from.fd, &name, &to.fd, &target, fs::RenameFlags::NOREPLACE)
+            .map_err(error)?;
+    }
     let after = to.stat(&target)?;
     if before.st_dev != after.st_dev
         || before.st_ino != after.st_ino
@@ -405,4 +493,10 @@ pub fn set_permissions(
         return Err(refusal("permission result changed; recovery required"));
     }
     Ok(stamp(&after))
+}
+
+/// Renames between absolute paths without replacing an existing destination (used to put an item
+/// back from the Trash, which lives outside any authorized scope).
+pub fn rename_absolute_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::renameat_with(fs::CWD, from, fs::CWD, to, fs::RenameFlags::NOREPLACE).map_err(error)
 }

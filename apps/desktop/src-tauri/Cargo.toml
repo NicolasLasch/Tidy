@@ -1,6 +1,6 @@
 [package]
 name = "tidy-desktop"
-version = "0.8.2"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -9,7 +9,7 @@ license = "MIT"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["rt", "sync"] }
 serde = { version = "1", features = ["derive"] }

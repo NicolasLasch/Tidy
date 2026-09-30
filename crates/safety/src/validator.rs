@@ -78,9 +78,22 @@ pub fn validate_move(
         }
     }
 
-    // Validate destination path
-    if fs::symlink_metadata(&destination).is_ok() {
-        return Err(Rejection::Collision(destination.display().to_string()));
+    // Validate destination path. A rename that only changes letter case names the same file on a
+    // case-insensitive volume; that is allowed, anything else existing is a collision.
+    if let Ok(existing) = fs::symlink_metadata(&destination) {
+        #[cfg(unix)]
+        let same_file = {
+            use std::os::unix::fs::MetadataExt;
+            existing.dev() == meta.dev()
+                && existing.ino() == meta.ino()
+                && relative_source.to_string_lossy().to_lowercase()
+                    == relative_dest.to_string_lossy().to_lowercase()
+        };
+        #[cfg(not(unix))]
+        let same_file = false;
+        if !same_file {
+            return Err(Rejection::Collision(destination.display().to_string()));
+        }
     }
 
     // Verify destination stays within scope
@@ -235,6 +248,10 @@ pub fn validate_trash_dir(
             original_modified: file_modified_secs(&meta),
             files: tree.files,
             dirs: tree.dirs,
+            read_only: {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o200 == 0
+            },
         })
     }
     #[cfg(not(unix))]
@@ -246,11 +263,98 @@ pub fn validate_trash_dir(
     }
 }
 
+/// A folder that does not exist yet, inside the scope, on the same volume as its nearest parent.
+pub fn validate_create_dir(
+    scope: &AuthorizedRoot,
+    relative: &Path,
+) -> Result<ValidatedAction, Rejection> {
+    check_no_traversal(relative)?;
+    let source = scope.path().join(relative);
+    if fs::symlink_metadata(&source).is_ok() {
+        return Err(Rejection::Collision(source.display().to_string()));
+    }
+    if tidy_platform::protected(&source) || !source.starts_with(scope.path()) {
+        return Err(Rejection::ProtectedPath);
+    }
+    for parent in source.ancestors().skip(1) {
+        if fs::symlink_metadata(parent).is_ok() {
+            scope
+                .validate(parent)
+                .map_err(|_| Rejection::OutsideScope)?;
+            break;
+        }
+    }
+    Ok(ValidatedAction::CreateDir {
+        source,
+        relative_source: relative.to_path_buf(),
+    })
+}
+/// Whole-folder move or rename: existing real directory, absent destination, never into itself.
+pub fn validate_move_dir(
+    scope: &AuthorizedRoot,
+    relative_source: &Path,
+    relative_dest: &Path,
+) -> Result<ValidatedAction, Rejection> {
+    check_no_traversal(relative_dest)?;
+    if relative_dest.starts_with(relative_source) {
+        return Err(Rejection::InvalidAction(
+            "A folder cannot move into itself".into(),
+        ));
+    }
+    let ValidatedAction::TrashDir {
+        source,
+        relative_source,
+        original_size,
+        files,
+        dirs,
+        read_only,
+        ..
+    } = validate_trash_dir(scope, relative_source)?
+    else {
+        unreachable!()
+    };
+    let destination = scope.path().join(relative_dest);
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(Rejection::Collision(destination.display().to_string()));
+    }
+    if tidy_platform::protected(&destination) || !destination.starts_with(scope.path()) {
+        return Err(Rejection::ProtectedPath);
+    }
+    for parent in destination.ancestors().skip(1) {
+        if fs::symlink_metadata(parent).is_ok() {
+            scope
+                .validate(parent)
+                .map_err(|_| Rejection::OutsideScope)?;
+            break;
+        }
+    }
+    Ok(ValidatedAction::MoveDir {
+        source,
+        destination,
+        relative_source,
+        relative_dest: relative_dest.to_path_buf(),
+        files,
+        dirs,
+        original_size,
+        read_only,
+    })
+}
+
 pub fn action_fingerprint(
     scope: &AuthorizedRoot,
     action: &ValidatedAction,
 ) -> Result<String, Rejection> {
+    if let ValidatedAction::CreateDir { source, .. } = action {
+        return if fs::symlink_metadata(source).is_ok() {
+            Err(Rejection::Collision(source.display().to_string()))
+        } else {
+            Ok("create".into())
+        };
+    }
     if let ValidatedAction::TrashDir {
+        relative_source, ..
+    }
+    | ValidatedAction::MoveDir {
         relative_source, ..
     } = action
     {
@@ -369,6 +473,21 @@ pub fn validate_permissions(
         let _ = (source, relative_source, original_size, original_modified);
         Err(Rejection::InvalidAction(
             "Unix mode changes are unavailable on this platform".into(),
+        ))
+    }
+}
+
+pub fn fingerprint_dir(scope: &AuthorizedRoot, relative: &Path) -> Result<String, Rejection> {
+    #[cfg(unix)]
+    {
+        tidy_platform::handles::dir_fingerprint_relative(scope, relative)
+            .map_err(|e| Rejection::ChangedSource(format!("{}: {e}", relative.display())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (scope, relative);
+        Err(Rejection::InvalidAction(
+            "Unavailable on this platform".into(),
         ))
     }
 }

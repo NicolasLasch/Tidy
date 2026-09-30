@@ -4,9 +4,9 @@
 
 #![allow(clippy::all)]
 
-use crate::investigation::{FolderTarget, Investigation, Source, Trace};
+use crate::investigation::{FolderTarget, Investigation, ListItem, Section, Source, Trace};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 use tidy_organization::{FileCandidate, OrganizationMode, Proposal, ProposedAction};
@@ -39,9 +39,17 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 fn tokens(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .replace(['’', '‘', '“', '”'], "'")
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '!' | '?' | '(' | ')' | '"'))
+    raw_tokens(text)
+        .into_iter()
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+/// Same splitting as `tokens`, but keeps the user's capitalization for names they want created.
+fn raw_tokens(text: &str) -> Vec<String> {
+    // Commas and semicolons survive as "," tokens so lists of names can be split later.
+    text.replace(['’', '‘', '“', '”'], "'")
+        .replace([',', ';'], " , ")
+        .split(|c: char| c.is_whitespace() || matches!(c, '!' | '?' | '(' | ')' | '"'))
         .map(|w| {
             w.trim_matches(|c: char| {
                 matches!(c, '\'' | ':' | '.') && !w.starts_with('.') || c == '\'' || c == ':'
@@ -171,6 +179,20 @@ fn folders_of(files: &[FileCandidate]) -> Vec<Folder> {
 }
 /// Best-matching folders for a spoken name; equal-quality matches are ordered by size.
 fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
+    if let [only] = phrase
+        && only.contains('/')
+    {
+        let wanted = only.trim_matches('/').to_lowercase();
+        let mut exact: Vec<&Folder> = folders
+            .iter()
+            .filter(|f| {
+                let path = f.path.to_string_lossy().to_lowercase();
+                path == wanted || path.ends_with(&format!("/{wanted}"))
+            })
+            .collect();
+        exact.sort_by_key(|f| (f.path.components().count(), std::cmp::Reverse(f.bytes)));
+        return exact;
+    }
     let phrase: Vec<&String> = phrase
         .iter()
         .filter(|w| !FILLER.contains(&w.as_str()))
@@ -182,13 +204,13 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
     if phrase_norm.len() < 2 {
         return vec![];
     }
-    let mut scored: Vec<(u8, &Folder)> = folders
+    let mut scored: Vec<(i32, &Folder)> = folders
         .iter()
         .filter_map(|f| {
             if f.name_norm.is_empty() {
                 return None;
             }
-            let score = if f.name_norm == phrase_norm {
+            let score: u8 = if f.name_norm == phrase_norm {
                 4
             } else if phrase.iter().all(|p| {
                 f.name_tokens
@@ -203,13 +225,76 @@ fn resolve<'a>(phrase: &[String], folders: &'a [Folder]) -> Vec<&'a Folder> {
             } else {
                 return None;
             };
-            Some((score, f))
+            // Folders inside build output are rarely what a person means by a name.
+            // Deeper folders count for less (a project beats a same-named folder six levels down),
+            // and build output counts for least.
+            let depth = f.path.components().count() as i32;
+            let mut effective = i32::from(score) * 2 - (depth - 2).max(0);
+            if in_build_output(&f.path) {
+                effective -= 6;
+            }
+            Some((effective, f))
         })
         .collect();
+    if scored.is_empty() {
+        // Looser match for names typed from memory ("background animated web" -> Background-animated):
+        // every word of the folder name appears in the request, or a distinctive request word
+        // (rare across folder names) matches one. Common words like "game" never decide alone.
+        let mut frequency: HashMap<&str, usize> = HashMap::new();
+        for f in folders {
+            for t in &f.name_tokens {
+                *frequency.entry(t.as_str()).or_default() += 1;
+            }
+        }
+        scored = folders
+            .iter()
+            .filter_map(|f| {
+                if f.name_norm.len() < 4 {
+                    return None;
+                }
+                let covers = !f.name_tokens.is_empty()
+                    && f.name_tokens
+                        .iter()
+                        .all(|t| phrase.iter().any(|p| p.as_str() == t));
+                let distinctive = phrase.iter().any(|p| {
+                    p.len() >= 3
+                        && f.name_tokens.iter().any(|t| {
+                            (t == *p || t.starts_with(p.as_str()))
+                                && frequency.get(t.as_str()).copied().unwrap_or(0) <= 2
+                        })
+                });
+                if covers {
+                    Some((1, f))
+                } else if distinctive {
+                    Some((0, f))
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
     let best = scored.iter().map(|(s, _)| *s).max().unwrap_or(0);
     scored.retain(|(s, _)| *s == best);
     scored.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.1.path.cmp(&b.1.path)));
     scored.into_iter().map(|(_, f)| f).collect()
+}
+fn in_build_output(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_string_lossy().as_ref(),
+            "build"
+                | "dist"
+                | "target"
+                | "node_modules"
+                | ".gradle"
+                | "out"
+                | ".next"
+                | "Pods"
+                | "DerivedData"
+                | "__pycache__"
+                | ".cache"
+        )
+    })
 }
 fn outermost<'a>(found: Vec<&'a Folder>) -> Vec<&'a Folder> {
     let all: Vec<&Path> = found.iter().map(|f| f.path.as_path()).collect();
@@ -226,6 +311,25 @@ fn target(f: &Folder) -> FolderTarget {
         path: f.path.to_string_lossy().into_owned(),
         files: f.files,
         bytes: f.bytes,
+        note: None,
+    }
+}
+fn folder_item(f: &Folder) -> ListItem {
+    ListItem {
+        kind: "folder",
+        path: f.path.to_string_lossy().into_owned(),
+        bytes: f.bytes,
+        files: f.files,
+        note: None,
+    }
+}
+fn file_item(f: &FileCandidate) -> ListItem {
+    ListItem {
+        kind: "file",
+        path: f.relative_path.to_string_lossy().into_owned(),
+        bytes: f.size,
+        files: 1,
+        note: None,
     }
 }
 
@@ -501,7 +605,7 @@ fn parse_excludes(words: &[String]) -> Vec<String> {
         }
         let mut phrase: Vec<String> = Vec::new();
         for next in &words[i + 1..] {
-            if matches!(next.as_str(), "and" | "but" | "or" | "then") {
+            if matches!(next.as_str(), "and" | "but" | "or" | "then" | ",") {
                 if !phrase.is_empty() {
                     out.push(phrase.join(" "));
                     phrase.clear();
@@ -872,6 +976,7 @@ fn artifact_dirs(files: &[FileCandidate]) -> Vec<FolderTarget> {
             path: path.to_string_lossy().into_owned(),
             files,
             bytes,
+            note: None,
         })
         .collect();
     out.sort_by_key(|f| std::cmp::Reverse(f.bytes));
@@ -882,17 +987,22 @@ struct Ctx<'a> {
     files: &'a [FileCandidate],
     scope: &'a str,
     now: i64,
+    /// The authorized folder on disk, so read-only metadata (launcher instance versions) can be read.
+    root: Option<&'a Path>,
 }
 fn reply(ctx: &Ctx, workflow: &str, headline: &str, detail: String, text: String) -> Investigation {
     Investigation {
         engine: "instant".into(),
-        workflow: crate::workflows::get(workflow).cloned(),
+        workflow: Some(workflow.to_string()),
         proposal: Proposal {
             actions: vec![],
             rationale: text,
         },
         sources: vec![],
         folders: vec![],
+        pick: false,
+        sections: vec![],
+        unresolved: false,
         trace: vec![Trace {
             label: headline.into(),
             detail,
@@ -911,7 +1021,7 @@ fn help(ctx: &Ctx) -> Investigation {
         "Ready",
         "No model needed for these requests".into(),
         format!(
-            "I can look through {} ({}) and get things done — just tell me what you want:\n\n• “Delete the Lucky World Invasion folder”\n• “Remove all .log files older than 3 months”\n• “Delete the 10 biggest files”\n• “Clean up build artifacts and node_modules”\n• “Organize this folder by type” or “by date”\n• “What’s taking the most space?”\n• “Find invoice”\n\nEverything goes to the Trash after you approve a preview, so it can always be restored from Finder.",
+            "I can look through {} ({}) and get things done — just tell me what you want:\n\n• “Delete the Lucky World Invasion folder”\n• “Remove all .log files older than 3 months”\n• “Rename the Old Stuff folder to Archive”\n• “Create a folder called Invoices”\n• “Move all PDFs into Documents/PDFs”\n• “Delete the 10 biggest files”\n• “List all my projects”\n• “Clean up build artifacts and node_modules”\n• “Organize this folder by type” or “by date”\n• “What’s taking the most space?”\n• “Find invoice”\n\nEverything goes to the Trash after you approve a preview, so it can always be restored from Finder.",
             plural(ctx.files.len(), "indexed file", "indexed files"),
             ctx.scope
         ),
@@ -924,6 +1034,7 @@ pub fn not_understood(indexed: usize, why: &str) -> Investigation {
         files: &files,
         scope: "this folder",
         now: 0,
+        root: None,
     };
     let mut r = reply(
         &ctx,
@@ -939,63 +1050,77 @@ pub fn not_understood(indexed: usize, why: &str) -> Investigation {
 }
 fn overview(ctx: &Ctx, folders: &[Folder], words: &[String]) -> Investigation {
     let total: u64 = ctx.files.iter().map(|f| f.size).sum();
-    let mut text = format!(
-        "{} holds {} ({}).",
-        ctx.scope,
-        plural(ctx.files.len(), "indexed file", "indexed files"),
-        bytes(total)
-    );
     let want_files = has(words, &["file", "files"])
         && has(words, &["biggest", "largest", "heaviest", "big", "large"]);
-    let want_folders = has(words, &["folder", "folders", "directory", "directories"]);
-    if !want_files || want_folders {
+    let deep = has(
+        words,
+        &[
+            "where",
+            "deep",
+            "deeper",
+            "nested",
+            "subfolders",
+            "sub-folders",
+        ],
+    );
+    let mut sections = Vec::new();
+    if !want_files {
         let mut top: Vec<&Folder> = folders
             .iter()
             .filter(|f| f.path.components().count() == 1)
             .collect();
         top.sort_by_key(|f| std::cmp::Reverse(f.bytes));
         if !top.is_empty() {
-            text.push_str("\n\nLargest folders here:");
-            for f in top.iter().take(8) {
-                text.push_str(&format!(
-                    "\n• {} — {} ({} files)",
-                    f.path.display(),
-                    bytes(f.bytes),
-                    f.files
-                ));
-            }
+            sections.push(Section {
+                title: format!("Folders in {}", ctx.scope),
+                items: top.iter().take(150).map(|f| folder_item(f)).collect(),
+            });
         }
-        let mut deep: Vec<&Folder> = folders
+        let mut here: Vec<&FileCandidate> = ctx
+            .files
             .iter()
-            .filter(|f| f.path.components().count() > 1 && f.bytes > 0)
+            .filter(|f| f.relative_path.components().count() == 1)
             .collect();
-        deep.sort_by_key(|f| std::cmp::Reverse(f.bytes));
-        let leaves: Vec<&&Folder> = deep
-            .iter()
-            .filter(|f| !top.iter().any(|t| t.path == f.path))
-            .filter(|f| {
-                !deep.iter().any(|o| {
-                    o.path != f.path && o.path.starts_with(&f.path) && o.bytes * 10 >= f.bytes * 9
+        here.sort_by_key(|f| std::cmp::Reverse(f.size));
+        if !here.is_empty() {
+            sections.push(Section {
+                title: format!("Files directly in {}", ctx.scope),
+                items: here.iter().take(30).map(|f| file_item(f)).collect(),
+            });
+        }
+        if deep {
+            let mut nested: Vec<&Folder> = folders
+                .iter()
+                .filter(|f| f.path.components().count() > 1 && f.bytes > 0)
+                .collect();
+            nested.sort_by_key(|f| std::cmp::Reverse(f.bytes));
+            let leaves: Vec<&Folder> = nested
+                .iter()
+                .copied()
+                .filter(|f| {
+                    !nested.iter().any(|o| {
+                        o.path != f.path
+                            && o.path.starts_with(&f.path)
+                            && o.bytes * 10 >= f.bytes * 9
+                    })
                 })
-            })
-            .take(5)
-            .collect();
-        if !leaves.is_empty() {
-            text.push_str("\n\nWhere the space actually sits:");
-            for f in leaves {
-                text.push_str(&format!("\n• {} — {}", f.path.display(), bytes(f.bytes)));
+                .take(8)
+                .collect();
+            if !leaves.is_empty() {
+                sections.push(Section {
+                    title: "Where the space actually sits".into(),
+                    items: leaves.iter().map(|f| folder_item(f)).collect(),
+                });
             }
         }
     }
-    let mut files: Vec<&FileCandidate> = ctx.files.iter().collect();
-    files.sort_by_key(|f| std::cmp::Reverse(f.size));
-    text.push_str("\n\nBiggest files:");
-    for f in files.iter().take(if want_files { 12 } else { 5 }) {
-        text.push_str(&format!(
-            "\n• {} — {}",
-            f.relative_path.display(),
-            bytes(f.size)
-        ));
+    if want_files {
+        let mut files: Vec<&FileCandidate> = ctx.files.iter().collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.size));
+        sections.push(Section {
+            title: "Biggest files".into(),
+            items: files.iter().take(15).map(|f| file_item(f)).collect(),
+        });
     }
     let mut kinds: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for f in ctx.files {
@@ -1012,16 +1137,23 @@ fn overview(ctx: &Ctx, folders: &[Folder], words: &[String]) -> Investigation {
     }
     let mut kinds: Vec<_> = kinds.into_iter().collect();
     kinds.sort_by_key(|(_, (_, b))| std::cmp::Reverse(*b));
-    text.push_str("\n\nMost space by type: ");
-    text.push_str(
-        &kinds
+    let text = format!(
+        "{} holds {} ({}). {}\n\nMost space by type: {}.\nAsk “what’s inside <folder>” to look deeper, or tell me what to remove.",
+        ctx.scope,
+        plural(ctx.files.len(), "indexed file", "indexed files"),
+        bytes(total),
+        if want_files {
+            "Here are its biggest files."
+        } else {
+            "Here are its folders, biggest first."
+        },
+        kinds
             .iter()
             .take(5)
             .map(|(k, (n, b))| format!(".{k} {} ({n})", bytes(*b)))
             .collect::<Vec<_>>()
-            .join(", "),
+            .join(", ")
     );
-    text.push_str("\n\nTell me what to remove — for example “delete the biggest folder” — and I’ll prepare it for your approval.");
     let mut r = reply(
         ctx,
         "analyze_storage",
@@ -1029,8 +1161,92 @@ fn overview(ctx: &Ctx, folders: &[Folder], words: &[String]) -> Investigation {
         format!("Summed all {} indexed files", ctx.files.len()),
         text,
     );
+    r.sections = sections;
     r.examined = ctx.files.len();
     r
+}
+/// "what's inside X": the subfolders and files directly inside one folder, with sizes.
+fn folder_contents(ctx: &Ctx, words: &[String], folders: &[Folder]) -> Option<Investigation> {
+    let at = words
+        .iter()
+        .position(|w| matches!(w.as_str(), "inside" | "in" | "of" | "into" | "contents"))
+        .or_else(|| {
+            words
+                .iter()
+                .position(|w| matches!(w.as_str(), "show" | "open" | "list" | "see"))
+        })?;
+    let phrase: Vec<String> = words[at + 1..]
+        .iter()
+        .filter(|w| {
+            !FILLER.contains(&w.as_str())
+                && !matches!(
+                    w.as_str(),
+                    "contents"
+                        | "content"
+                        | "show"
+                        | "me"
+                        | "what"
+                        | "what's"
+                        | "is"
+                        | "are"
+                        | "there"
+                        | "things"
+                        | "stuff"
+                        | "files"
+                        | "folders"
+                )
+        })
+        .cloned()
+        .collect();
+    if phrase.is_empty() {
+        return None;
+    }
+    let folder = *resolve(&phrase, folders).first()?;
+    let mut subs: Vec<&Folder> = folders
+        .iter()
+        .filter(|f| f.path.parent() == Some(folder.path.as_path()))
+        .collect();
+    subs.sort_by_key(|f| std::cmp::Reverse(f.bytes));
+    let mut direct: Vec<&FileCandidate> = ctx
+        .files
+        .iter()
+        .filter(|f| f.relative_path.parent() == Some(folder.path.as_path()))
+        .collect();
+    direct.sort_by_key(|f| std::cmp::Reverse(f.size));
+    let name = folder
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut sections = Vec::new();
+    if !subs.is_empty() {
+        sections.push(Section {
+            title: format!("Folders in {name}"),
+            items: subs.iter().take(150).map(|f| folder_item(f)).collect(),
+        });
+    }
+    if !direct.is_empty() {
+        sections.push(Section {
+            title: format!("Files directly in {name}"),
+            items: direct.iter().take(40).map(|f| file_item(f)).collect(),
+        });
+    }
+    let mut r = reply(
+        ctx,
+        "inspect_folder",
+        "Opened a folder",
+        format!("Listed {}", folder.path.display()),
+        format!(
+            "{} — {} in {} ({} and {} directly inside).",
+            folder.path.display(),
+            bytes(folder.bytes),
+            plural(folder.files, "file", "files"),
+            plural(subs.len(), "folder", "folders"),
+            plural(direct.len(), "file", "files")
+        ),
+    );
+    r.sections = sections;
+    Some(r)
 }
 fn find(ctx: &Ctx, words: &[String]) -> Option<Investigation> {
     let terms: Vec<String> = words
@@ -1092,31 +1308,27 @@ fn find(ctx: &Ctx, words: &[String]) -> Option<Investigation> {
             ctx.scope
         )
     } else {
-        let mut t = format!(
-            "Found {} matching “{}”:",
+        format!(
+            "Found {} matching “{}”. Say “delete them” if you want these moved to the Trash.",
             plural(total, "file", "files"),
             terms.join(" ")
-        );
-        for f in hits.iter().take(15) {
-            t.push_str(&format!(
-                "\n• {} — {}",
-                f.relative_path.display(),
-                bytes(f.size)
-            ));
-        }
-        if total > 15 {
-            t.push_str(&format!("\n…and {} more.", total - 15));
-        }
-        t.push_str("\n\nSay “delete them” if you want these moved to the Trash.");
-        t
+        )
     };
-    Some(reply(
+    let mut found = reply(
         ctx,
         "find_filename",
         "Searched filenames",
         format!("Checked all {} paths", ctx.files.len()),
         text,
-    ))
+    );
+    if total > 0 {
+        found.sections.push(Section {
+            title: format!("Matching files ({total})"),
+            items: hits.iter().take(40).map(|f| file_item(f)).collect(),
+        });
+    }
+    found.unresolved = total == 0;
+    Some(found)
 }
 
 fn trash_files(ctx: &Ctx, c: &Criteria) -> Investigation {
@@ -1225,7 +1437,7 @@ fn phrases_for_folders(words: &[String]) -> (Vec<Vec<String>>, Option<Vec<String
             }
             continue;
         }
-        if matches!(w.as_str(), "and" | "&" | "plus") {
+        if matches!(w.as_str(), "and" | "&" | "plus" | ",") {
             if !target.is_empty() {
                 phrases.push(std::mem::take(&mut target));
             }
@@ -1256,13 +1468,21 @@ fn trash_folders(
     let mut missing: Vec<String> = Vec::new();
     for phrase in &phrases {
         let mut found = resolve(phrase, folders);
-        if let Some(parents) = &parent_filter {
-            if !parents.is_empty() {
-                found.retain(|f| {
+        if let Some(parents) = &parent_filter
+            && !parents.is_empty()
+        {
+            // A vague parent hint only narrows the choice; it never removes every candidate.
+            let narrowed: Vec<&Folder> = found
+                .iter()
+                .copied()
+                .filter(|f| {
                     parents
                         .iter()
                         .any(|p| f.path.starts_with(&p.path) && f.path != p.path)
-                });
+                })
+                .collect();
+            if !narrowed.is_empty() {
+                found = narrowed;
             }
         }
         let wants_all = words
@@ -1502,17 +1722,55 @@ pub fn respond(
     scope_name: &str,
     now: i64,
 ) -> Option<Investigation> {
+    respond_in(request, files, scope_name, now, None)
+}
+pub fn respond_in(
+    request: &str,
+    files: &[FileCandidate],
+    scope_name: &str,
+    now: i64,
+    root: Option<&Path>,
+) -> Option<Investigation> {
     let ctx = Ctx {
         files,
         scope: scope_name,
         now,
+        root,
     };
-    let last = request
-        .rsplit("User follow-up:")
-        .next()
-        .unwrap_or(request)
-        .trim();
+    let (first, follow) = match request.split_once("User follow-up:") {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (request.trim(), ""),
+    };
     let folders = folders_of(files);
+    if !follow.is_empty() {
+        // "delete them" / "all of them" after a list of folders: act on that list.
+        let words = tokens(follow);
+        let pronoun = !words.is_empty()
+            && words.len() <= 6
+            && has(&words, &["them", "those", "these", "all", "everything"])
+            && has(&words, &["delete", "remove", "trash", "erase", "discard"]);
+        if pronoun {
+            let (w, r) = strip_purpose(tokens(first), raw_tokens(first));
+            let _ = r;
+            if let Some(list) = list_named(&ctx, &w, &folders, false, false) {
+                let total: u64 = list.folders.iter().map(|f| f.bytes).sum();
+                let mut out = reply(
+                    &ctx,
+                    "trash_named_files",
+                    "Understood your request",
+                    format!("Move {} folders to Trash", list.folders.len()),
+                    format!(
+                        "{} ({}) ready for the Trash. Each moves whole and stays recoverable from Finder’s Trash. Nothing happens until you approve.",
+                        plural(list.folders.len(), "folder", "folders"),
+                        bytes(total)
+                    ),
+                );
+                out.folders = list.folders;
+                return Some(out);
+            }
+        }
+    }
+    let last = if follow.is_empty() { first } else { follow };
     interpret(&ctx, last, &folders).or_else(|| {
         if last != request.trim() {
             interpret(&ctx, request, &folders)
@@ -1539,6 +1797,11 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
         || words == ["?"]
     {
         return Some(help(ctx));
+    }
+    let raw = raw_tokens(text);
+    let (words, raw) = strip_purpose(words, raw);
+    if let Some(r) = structural(ctx, &raw, &words, folders) {
+        return Some(r);
     }
     let mut verb = detect_verb(&words)?;
     if verb == Verb::Organize && parse_criteria(&words, folders).dev {
@@ -1584,6 +1847,14 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
     match verb {
         Verb::Trash => {
             let c = parse_criteria(&words, folders);
+            // "delete all my modrinth profiles": show the profiles to pick from instead of
+            // guessing that the whole launcher folder is meant.
+            if (has(&words, &["all", "every", "my", "the", "those", "these"])
+                || split_filter(&words).1.is_some())
+                && let Some(r) = list_named(ctx, &words, folders, true, true)
+            {
+                return Some(r);
+            }
             let quoted_or_folderish = has(
                 &words,
                 &["folder", "folders", "directory", "directories", "dir"],
@@ -1639,7 +1910,7 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
                         .join(" ");
                     let mut close: Vec<&Folder> = folders.iter().collect();
                     close.sort_by_key(|f| std::cmp::Reverse(f.bytes));
-                    return Some(reply(
+                    let mut r = reply(
                         ctx,
                         "trash_named_files",
                         "Looked for the folder",
@@ -1654,7 +1925,9 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
-                    ));
+                    );
+                    r.clarification = Some(r.proposal.rationale.clone());
+                    return Some(r);
                 }
             }
             if c.targets_files() {
@@ -1664,6 +1937,31 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
         }
         Verb::Organize => organize(ctx, &words),
         Verb::Show => {
+            // Questions about the last answer ("how come…", "why…") are not file searches.
+            if contains_seq(&words, &["how", "come"]) || words.first().is_some_and(|w| w == "why") {
+                return None;
+            }
+            // "what's inside X" is an explicit request to open one folder.
+            if has(&words, &["inside", "contents"])
+                && let Some(r) = folder_contents(ctx, &words, folders)
+            {
+                return Some(r);
+            }
+            // "find <words>" searches names; only "list all my <things>" maps a noun to folders.
+            if !has(&words, &["find", "search", "where", "locate", "look"])
+                && let Some(r) = list_named(ctx, &words, folders, false, false)
+            {
+                return Some(r);
+            }
+            let overview_words = has(
+                &words,
+                &[
+                    "space", "storage", "biggest", "largest", "heaviest", "disk", "taking", "takes",
+                ],
+            );
+            if !overview_words && let Some(r) = folder_contents(ctx, &words, folders) {
+                return Some(r);
+            }
             let wants_overview = has(
                 &words,
                 &[
@@ -1715,29 +2013,29 @@ fn interpret(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation>
                     format!("No files match {}.", c.label)
                 } else {
                     format!(
-                        "{} match {} — {} in total:",
+                        "{} match {} — {} in total. Say “delete them” and I’ll prepare these for the Trash.",
                         plural(total, "file", "files"),
                         c.label,
                         bytes(total_bytes)
                     )
                 };
-                for f in hits.iter().take(15) {
-                    text.push_str(&format!(
-                        "\n• {} — {}",
-                        f.relative_path.display(),
-                        bytes(f.size)
-                    ));
+                if total > 40 {
+                    text.push_str(" Showing the biggest 40.");
                 }
-                if total > 0 {
-                    text.push_str("\n\nSay “delete them” and I’ll prepare these for the Trash.");
-                }
-                return Some(reply(
+                let mut r = reply(
                     ctx,
                     "find_filename",
                     "Filtered the index",
                     format!("Checked all {} indexed files", ctx.files.len()),
                     text,
-                ));
+                );
+                if total > 0 {
+                    r.sections.push(Section {
+                        title: format!("Matching files ({total})"),
+                        items: hits.iter().take(40).map(|f| file_item(f)).collect(),
+                    });
+                }
+                return Some(r);
             }
             find(ctx, &words)
         }
@@ -1854,11 +2152,36 @@ mod tests {
     #[test]
     fn info_and_help() {
         let r = run("what's taking the most space?");
-        assert!(r.proposal.rationale.contains("Instances"));
+        // Only the top-level folders are listed, as folder rows with sizes, never nested paths.
+        let top = &r.sections[0];
+        assert!(top.title.starts_with("Folders in"));
+        assert!(
+            top.items
+                .iter()
+                .any(|i| i.path == "curseforge" && i.kind == "folder")
+        );
+        assert!(
+            top.items.iter().all(|i| !i.path.contains('/')),
+            "{:?}",
+            top.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
         assert!(r.proposal.actions.is_empty());
+        // Opening a folder shows its own subfolders and files.
+        let r = run("what's inside curseforge/minecraft/Instances");
+        assert!(
+            r.sections[0]
+                .items
+                .iter()
+                .any(|i| i.path.ends_with("Lucky World Invasion"))
+        );
         assert!(run("hi").proposal.rationale.contains("Delete the Lucky"));
         let r = run("find setup");
-        assert!(r.proposal.rationale.contains("setup.dmg"));
+        assert!(
+            r.sections[0]
+                .items
+                .iter()
+                .any(|i| i.path.ends_with("setup.dmg") && i.kind == "file")
+        );
     }
     #[test]
     fn missing_folder_explains_instead_of_asking() {
@@ -1880,6 +2203,270 @@ mod tests {
         );
     }
     #[test]
+    fn structural_requests_create_move_rename() {
+        let r = run("create a new folder called Client Work");
+        assert!(
+            matches!(&r.proposal.actions[0], ProposedAction::CreateFolder { path } if path == Path::new("Client Work"))
+        );
+        let r = run("create folders Invoices and Receipts in Downloads");
+        assert_eq!(r.proposal.actions.len(), 2);
+        assert!(
+            matches!(&r.proposal.actions[0], ProposedAction::CreateFolder { path } if path == Path::new("Downloads/Invoices"))
+        );
+        let r = run("rename the Lucky World Invasion folder to Lucky Archive");
+        assert!(
+            matches!(&r.proposal.actions[0], ProposedAction::MoveFolder { destination_relative, .. } if destination_relative == Path::new("curseforge/minecraft/Instances/Lucky Archive"))
+        );
+        let r = run("rename setup.dmg to Installer");
+        assert!(
+            matches!(&r.proposal.actions[0], ProposedAction::Rename { new_name, .. } if new_name == "Installer.dmg")
+        );
+        let r = run("move all log files into Old Logs");
+        assert_eq!(r.proposal.actions.len(), 2);
+        assert!(r.proposal.rationale.contains("will be created"));
+        let r = run("move FTB StoneBlock 4 into Downloads");
+        assert!(
+            matches!(&r.proposal.actions[0], ProposedAction::MoveFolder { destination_relative, .. } if destination_relative == Path::new("Downloads/FTB StoneBlock 4"))
+        );
+        assert!(
+            run("edit my notes")
+                .proposal
+                .rationale
+                .contains("don’t edit")
+        );
+    }
+    #[test]
+    fn nested_folder_with_fuzzy_parent_and_bare_path_followups() {
+        let files = vec![
+            f(1, "liveandhell-template-1.21.11/run/saves/w/a.mca", 100, 0),
+            f(2, "liveandhell-template-1.21.11/src/main.java", 10, 0),
+            f(3, "GameLegacy/run/x.txt", 5, 0),
+        ];
+        let go = |q: &str| respond(q, &files, "Coding Projects", 0);
+        let r = go("remove the run folder in life and hell").expect("handled");
+        assert_eq!(r.folders.len(), 1, "{}", r.proposal.rationale);
+        assert_eq!(r.folders[0].path, "liveandhell-template-1.21.11/run");
+        let r = go("delete the run folder in liveandhell-template-1.21.11").expect("handled");
+        assert_eq!(r.folders[0].path, "liveandhell-template-1.21.11/run");
+        // The parent hint matches an unrelated folder called "hell": still finds the run folder.
+        let mut more = files.clone();
+        more.push(f(9, "Hell Docs/readme.txt", 1, 0));
+        let r = respond(
+            "remove the run folder in life and hell",
+            &more,
+            "Coding Projects",
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.folders.len(), 1, "{}", r.proposal.rationale);
+        // Bare path as a follow-up to a failed removal.
+        let r = go("remove the run folder in life and hell\nUser follow-up: liveandhell-template-1.21.11/run").expect("handled");
+        assert_eq!(r.folders[0].path, "liveandhell-template-1.21.11/run");
+    }
+    #[test]
+    fn comma_separated_folder_lists_are_all_prepared() {
+        let files = vec![
+            f(1, "Cluedo-BSL2026/a.txt", 5, 0),
+            f(2, "Background-animated/index.html", 10, 0),
+            f(3, "Tank Game/main.js", 20, 0),
+            f(4, "AI Empire/x.py", 30, 0),
+            f(5, "Lone Blossom/y.ts", 40, 0),
+            f(6, "clocktower/src/game/G.java", 1, 0),
+            f(7, "other/game/H.java", 1, 0),
+            f(8, "keep/z.txt", 1, 0),
+        ];
+        let r = respond(
+            "delete the project like cluedo bsl, background animated web, tank game, ai empire, lone blossom",
+            &files,
+            "Coding Projects",
+            0,
+        )
+        .unwrap();
+        let paths: Vec<_> = r.folders.iter().map(|f| f.path.as_str()).collect();
+        for expected in [
+            "Cluedo-BSL2026",
+            "Background-animated",
+            "Tank Game",
+            "AI Empire",
+            "Lone Blossom",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "{expected} missing from {paths:?}: {}",
+                r.proposal.rationale
+            );
+        }
+        assert_eq!(paths.len(), 5, "{paths:?}");
+        assert!(!paths.iter().any(|p| p.ends_with("/game")));
+    }
+    #[test]
+    fn launcher_profiles_are_found_as_instances_and_can_be_picked() {
+        let files = vec![
+            f(
+                1,
+                "curseforge/minecraft/Instances/NightfallCraft/mods/a.jar",
+                900,
+                0,
+            ),
+            f(
+                2,
+                "curseforge/minecraft/Instances/FTB StoneBlock 4/x.jar",
+                800,
+                0,
+            ),
+            f(
+                3,
+                "curseforge/minecraft/Instances/Lucky World/y.jar",
+                700,
+                0,
+            ),
+            f(4, "notes/todo.txt", 1, 0),
+        ];
+        let q = "List all my modrinth profiles on my computer so I will be able to remove those";
+        let r = respond(q, &files, "Documents", 0).expect("handled");
+        assert!(r.pick, "{}", r.proposal.rationale);
+        assert_eq!(r.folders.len(), 3);
+        assert!(r.folders.iter().any(|f| f.path.ends_with("NightfallCraft")));
+        // Follow-up prepares all of them.
+        let r = respond(
+            &format!("{q}\nUser follow-up: delete all of them"),
+            &files,
+            "Documents",
+            0,
+        )
+        .expect("handled");
+        assert!(!r.pick);
+        assert_eq!(r.folders.len(), 3);
+        // Nothing matching leaves the door open for the AI fallback.
+        let r = respond("find zzzunknownthing", &files, "Documents", 0).unwrap();
+        assert!(r.unresolved);
+    }
+    #[test]
+    fn instances_not_matching_a_version_are_removed_using_metadata() {
+        let dir = std::env::temp_dir().join(format!("tidy_versions_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, version) in [
+            ("Old Pack", "1.20.1"),
+            ("New Pack", "26.2"),
+            ("Mid Pack", "1.21.1"),
+        ] {
+            let inst = dir.join("curseforge/minecraft/Instances").join(name);
+            std::fs::create_dir_all(inst.join("mods")).unwrap();
+            std::fs::write(
+                inst.join("minecraftinstance.json"),
+                format!("{{\"name\":\"{name}\",\"gameVersion\": \"{version}\"}}"),
+            )
+            .unwrap();
+        }
+        let files = vec![
+            f(
+                1,
+                "curseforge/minecraft/Instances/Old Pack/mods/a.jar",
+                900,
+                0,
+            ),
+            f(
+                2,
+                "curseforge/minecraft/Instances/New Pack/mods/b.jar",
+                800,
+                0,
+            ),
+            f(
+                3,
+                "curseforge/minecraft/Instances/Mid Pack/mods/c.jar",
+                700,
+                0,
+            ),
+            f(
+                4,
+                "curseforge/minecraft/Instances/Old Pack/mods/x-26.2.jar",
+                5,
+                0,
+            ),
+        ];
+        let r = respond_in(
+            "remove the curseforge instances that are not the 26.2 version",
+            &files,
+            "Documents",
+            0,
+            Some(&dir),
+        )
+        .expect("handled");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut paths: Vec<_> = r
+            .folders
+            .iter()
+            .map(|f| f.path.rsplit('/').next().unwrap().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["Mid Pack", "Old Pack"], "{}", r.proposal.rationale);
+        assert!(r.proposal.actions.is_empty());
+        assert!(!r.pick);
+        assert!(r.proposal.rationale.contains("New Pack (Minecraft 26.2)"));
+    }
+    #[test]
+    fn nested_profiles_folders_are_not_offered_next_to_instances() {
+        let files = vec![
+            f(
+                1,
+                "curseforge/minecraft/Instances/Pack A/config/jade/profiles/1/x.json",
+                3,
+                0,
+            ),
+            f(
+                2,
+                "curseforge/minecraft/Instances/Pack A/mods/a.jar",
+                900,
+                0,
+            ),
+            f(
+                3,
+                "curseforge/minecraft/Instances/Pack B/mods/b.jar",
+                800,
+                0,
+            ),
+        ];
+        let r = respond("remove the curseforge instances that are not the 26.2 version, I found 189 matching 26.2", &files, "Docs", 0).unwrap();
+        let mut paths: Vec<_> = r.folders.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "curseforge/minecraft/Instances/Pack A",
+                "curseforge/minecraft/Instances/Pack B"
+            ],
+            "{}",
+            r.proposal.rationale
+        );
+        assert!(
+            r.proposal.rationale.contains("matching 26.2)"),
+            "{}",
+            r.proposal.rationale
+        );
+        assert!(!r.proposal.rationale.contains("found /"));
+    }
+    #[test]
+    fn a_name_prefers_the_project_over_folders_inside_its_build_output() {
+        let files = vec![
+            f(
+                1,
+                "chefmod-template-1.21.11/src/main/resources/assets/chefmod/a.png",
+                5,
+                0,
+            ),
+            f(
+                2,
+                "chefmod-template-1.21.11/build/resources/main/assets/chefmod/a.png",
+                9,
+                0,
+            ),
+            f(3, "chefmod-template-1.21.11/build.gradle", 1, 0),
+        ];
+        let r = respond("delete chef mod", &files, "Downloads", 0).unwrap();
+        assert_eq!(r.folders.len(), 1, "{}", r.proposal.rationale);
+        assert_eq!(r.folders[0].path, "chefmod-template-1.21.11");
+    }
+    #[test]
     fn project_listing_uses_markers_including_git() {
         let dir = std::env::temp_dir().join(format!("tidy_projects_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1896,8 +2483,18 @@ mod tests {
             "{}",
             r.proposal.rationale
         );
-        assert!(r.proposal.rationale.contains("Alpha") && r.proposal.rationale.contains("Rust"));
-        assert!(!r.proposal.rationale.contains("Notes"));
+        let items = &r.sections[0].items;
+        assert!(
+            items
+                .iter()
+                .any(|i| i.path == "Alpha" && i.note.as_deref().unwrap_or("").contains("Git"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.path == "Beta" && i.note.as_deref().unwrap_or("").contains("Rust"))
+        );
+        assert!(items.iter().all(|i| i.path != "Notes"));
     }
 }
 
@@ -1949,10 +2546,55 @@ const PROJECT_MARKERS: &[(&str, &str)] = &[
 /// Finds projects by their marker files on disk (Git repositories are not in the file index, so the
 /// index alone would miss them). Read-only, no-follow, bounded.
 pub fn list_projects(root: &Path, scope: &str, files: &[FileCandidate]) -> Investigation {
+    list_projects_with(root, scope, files, &ProjectOpts::default())
+}
+/// How a project list is presented; used for follow-ups like “only the Rust ones” or “biggest first”.
+#[derive(Default, Clone)]
+pub struct ProjectOpts {
+    /// Measure sizes from disk for every project missing from the index (longer time budget).
+    pub measure_all: bool,
+    pub only_kind: Option<String>,
+    pub sort: Option<String>,
+}
+/// Allocated bytes below `path`, stopping at `max_entries` or `deadline` (returns `None` then).
+fn measure_dir(
+    path: &Path,
+    max_entries: usize,
+    deadline: std::time::Instant,
+) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let (mut bytes, mut files, mut seen) = (0u64, 0u64, 0usize);
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            seen += 1;
+            if seen > max_entries || (seen % 512 == 0 && std::time::Instant::now() > deadline) {
+                return None;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                bytes += meta.blocks().saturating_mul(512);
+                files += 1;
+            }
+        }
+    }
+    Some((bytes, files))
+}
+pub fn list_projects_with(
+    root: &Path,
+    scope: &str,
+    files: &[FileCandidate],
+    opts: &ProjectOpts,
+) -> Investigation {
     let ctx = Ctx {
         files,
         scope,
         now: 0,
+        root: Some(root),
     };
     let folders = folders_of(files);
     let skip = [
@@ -2033,13 +2675,36 @@ pub fn list_projects(root: &Path, scope: &str, files: &[FileCandidate]) -> Inves
             plural(found.len(), "project", "projects")
         )
     };
-    for (path, kinds, modified) in found.iter().take(60) {
+    let mut items = Vec::new();
+    let budget = if opts.measure_all {
+        std::time::Duration::from_secs(20)
+    } else {
+        std::time::Duration::from_secs(3)
+    };
+    let deadline = std::time::Instant::now() + budget;
+    let (mut unmeasured, mut measured_now) = (0usize, 0usize);
+    if let Some(kind) = &opts.only_kind {
+        found.retain(|(_, kinds, _)| kinds.iter().any(|k| k.eq_ignore_ascii_case(kind)));
+    }
+    for (path, kinds, modified) in found.iter().take(80) {
         let rel = path.strip_prefix(root).unwrap_or(path);
-        let size = folders
-            .iter()
-            .find(|f| f.path == rel)
-            .map(|f| format!(" · {}", bytes(f.bytes)))
-            .unwrap_or_default();
+        let indexed = folders.iter().find(|f| f.path == rel);
+        let (mut bytes_here, mut files_here) = indexed.map_or((0, 0), |f| (f.bytes, f.files));
+        let mut from_disk = false;
+        if indexed.is_none_or(|f| f.files == 0) {
+            match measure_dir(
+                path,
+                if opts.measure_all { 3_000_000 } else { 250_000 },
+                deadline,
+            ) {
+                Some((b, n)) => {
+                    (bytes_here, files_here) = (b, n as usize);
+                    from_disk = true;
+                    measured_now += 1;
+                }
+                None => unmeasured += 1,
+            }
+        }
         let days = std::time::SystemTime::now()
             .duration_since(*modified)
             .map(|d| d.as_secs() / 86_400)
@@ -2050,24 +2715,1871 @@ pub fn list_projects(root: &Path, scope: &str, files: &[FileCandidate]) -> Inves
             d if d < 60 => format!("{d} days ago"),
             d => format!("{} months ago", d / 30),
         };
+        let mut note = format!("{} · changed {age}", kinds.join(", "));
+        if bytes_here == 0 && files_here == 0 {
+            note.push_str(if from_disk {
+                " · empty"
+            } else {
+                " · size not measured"
+            });
+        } else if from_disk {
+            note.push_str(" · size read from disk");
+        }
+        items.push(ListItem {
+            kind: "folder",
+            path: rel.to_string_lossy().into_owned(),
+            bytes: bytes_here,
+            files: files_here,
+            note: Some(note),
+        });
+    }
+    match opts.sort.as_deref() {
+        Some("size") => items.sort_by_key(|i| std::cmp::Reverse(i.bytes)),
+        Some("name") => items.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase())),
+        Some("oldest") => items.reverse(),
+        _ => {}
+    }
+    let _ = measured_now;
+    if unmeasured > 0 {
         text.push_str(&format!(
-            "\n• {} ({}) — {}{size} · {age}",
-            rel.display(),
-            kinds.join(", "),
-            rel.display()
+            " {unmeasured} are too large to measure quickly; say “measure them” to take longer."
         ));
     }
-    if found.len() > 60 {
-        text.push_str(&format!("\n…and {} more.", found.len() - 60));
+    if found.len() > 80 {
+        text.push_str(&format!(" Showing the first 80 of {}.", found.len()));
     }
     if !found.is_empty() {
-        text.push_str("\n\nSay “delete <project name>” to move one to the Trash, or “what’s taking space?” to see the heaviest.");
+        text.push_str(" Say “delete <project name>” to move one to the Trash.");
     }
-    reply(
+    let mut result = reply(
         &ctx,
         "find_project",
         "Looked for project markers",
         format!("Scanned folder structure below {scope}"),
         text,
+    );
+    if !items.is_empty() {
+        result.sections.push(Section {
+            title: format!("Projects in {scope}"),
+            items,
+        });
+    }
+    result
+}
+
+fn plan_reply(
+    ctx: &Ctx,
+    workflow: &str,
+    headline: &str,
+    detail: String,
+    text: String,
+    actions: Vec<ProposedAction>,
+    sources: Vec<Source>,
+) -> Investigation {
+    let mut r = reply(ctx, workflow, headline, detail, text);
+    r.proposal.actions = actions;
+    r.sources = sources;
+    r
+}
+fn clean_name(raw: &[String]) -> String {
+    let stop = [
+        "the",
+        "a",
+        "an",
+        "new",
+        "folder",
+        "folders",
+        "directory",
+        "called",
+        "named",
+        "file",
+        "it",
+        "as",
+        "to",
+        "into",
+        "in",
+        "my",
+        "this",
+        "that",
+    ];
+    let kept: Vec<&str> = raw
+        .iter()
+        .map(|w| w.as_str())
+        .skip_while(|w| stop.contains(&w.to_lowercase().as_str()))
+        .collect();
+    let mut name = kept.join(" ");
+    name = name
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ' '))
+        .to_string();
+    name
+}
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(name.trim_matches('/'));
+    if name.is_empty()
+        || name.len() > 200
+        || path.is_absolute()
+        || path.components().count() == 0
+        || path.components().any(|c| {
+            let text = c.as_os_str().to_string_lossy();
+            !matches!(c, std::path::Component::Normal(_)) || text.starts_with('.')
+        })
+    {
+        None
+    } else {
+        Some(path)
+    }
+}
+fn folder_exists(path: &Path, files: &[FileCandidate], folders: &[Folder]) -> bool {
+    folders.iter().any(|f| f.path == path) || files.iter().any(|f| f.relative_path == path)
+}
+/// Move / rename / create-folder requests. Names keep the capitalization the user typed.
+fn structural(
+    ctx: &Ctx,
+    raw: &[String],
+    words: &[String],
+    folders: &[Folder],
+) -> Option<Investigation> {
+    if let Some(r) = bulk_ops(ctx, raw, words, folders) {
+        return Some(r);
+    }
+    let first = |list: &[&str]| words.iter().position(|w| list.contains(&w.as_str()));
+    let neg = |at: usize| negated(words, at);
+    let dest_markers = ["to", "into", "in", "inside", "under", "within", "onto"];
+    if let Some(at) = first(&["rename"]) {
+        if neg(at) {
+            return None;
+        }
+        let split = words[at + 1..]
+            .iter()
+            .position(|w| matches!(w.as_str(), "to" | "as" | "into"))?
+            + at
+            + 1;
+        let subject: Vec<String> = words[at + 1..split]
+            .iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .cloned()
+            .collect();
+        let new_name = clean_name(&raw[split + 1..]);
+        if subject.is_empty() || new_name.is_empty() || new_name.contains('/') {
+            return None;
+        }
+        // Folder first, then a file with that name.
+        if let Some(folder) = resolve(&subject, folders).first() {
+            let dest = folder.path.with_file_name(&new_name);
+            let text = if folder_exists(&dest, ctx.files, folders) {
+                format!(
+                    "A folder or file named “{new_name}” already exists there, so I can’t rename “{}” to it. Nothing changed.",
+                    folder.path.display()
+                )
+            } else {
+                String::new()
+            };
+            if !text.is_empty() {
+                return Some(reply(
+                    ctx,
+                    "rename_descriptive",
+                    "Understood your request",
+                    "Rename folder".into(),
+                    text,
+                ));
+            }
+            return Some(plan_reply(
+                ctx,
+                "rename_descriptive",
+                "Understood your request",
+                format!("Rename folder {} → {new_name}", folder.path.display()),
+                format!(
+                    "Rename the folder “{}” to “{new_name}”. Everything inside stays where it is. Approve to apply; you can undo it from History.",
+                    folder.path.display()
+                ),
+                vec![ProposedAction::MoveFolder {
+                    source: folder.path.clone(),
+                    destination_relative: dest,
+                }],
+                vec![],
+            ));
+        }
+        let needle = alnum(&subject.join(""));
+        let mut hits: Vec<&FileCandidate> = ctx
+            .files
+            .iter()
+            .filter(|f| {
+                f.relative_path.file_name().is_some_and(|n| {
+                    alnum(&n.to_string_lossy()) == needle
+                        || alnum(&n.to_string_lossy()).starts_with(&needle) && needle.len() > 3
+                })
+            })
+            .collect();
+        hits.sort_by_key(|f| f.relative_path.components().count());
+        let file = hits.first()?;
+        let ext = file
+            .relative_path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned());
+        let final_name = match (&ext, Path::new(&new_name).extension()) {
+            (Some(e), None) => format!("{new_name}.{e}"),
+            _ => new_name.clone(),
+        };
+        if folder_exists(
+            &file.relative_path.with_file_name(&final_name),
+            ctx.files,
+            folders,
+        ) {
+            return Some(reply(
+                ctx,
+                "rename_descriptive",
+                "Understood your request",
+                "Rename file".into(),
+                format!(
+                    "“{final_name}” already exists in that folder, so I can’t rename to it. Nothing changed."
+                ),
+            ));
+        }
+        let mut r = plan_reply(
+            ctx,
+            "rename_descriptive",
+            "Understood your request",
+            format!("Rename {} → {final_name}", file.relative_path.display()),
+            format!(
+                "Rename “{}” to “{final_name}”{}.",
+                file.relative_path.display(),
+                if ext.is_some() && Path::new(&new_name).extension().is_none() {
+                    " (keeping its extension)"
+                } else {
+                    ""
+                }
+            ),
+            vec![ProposedAction::Rename {
+                source: file.id,
+                new_name: final_name,
+            }],
+            vec![Source {
+                id: file.id.0,
+                path: file.relative_path.to_string_lossy().into(),
+                size: file.size,
+            }],
+        );
+        r.examined = 1;
+        return Some(r);
+    }
+    if let Some(at) = first(&["create", "make", "add", "new"]) {
+        if !neg(at)
+            && has(words, &["folder", "folders", "directory", "directories"])
+            && !has(
+                words,
+                &["move", "put", "delete", "remove", "trash", "rename"],
+            )
+        {
+            let start = words
+                .iter()
+                .position(|w| matches!(w.as_str(), "called" | "named"))
+                .map(|i| i + 1)
+                .or_else(|| {
+                    words
+                        .iter()
+                        .position(|w| {
+                            matches!(
+                                w.as_str(),
+                                "folder" | "folders" | "directory" | "directories"
+                            )
+                        })
+                        .map(|i| i + 1)
+                })?;
+            let end = words[start..]
+                .iter()
+                .position(|w| dest_markers.contains(&w.as_str()) && *w != "to")
+                .map(|i| i + start)
+                .unwrap_or(words.len());
+            let names_raw = &raw[start..end];
+            let parent = if end < words.len() {
+                let phrase: Vec<String> = words[end + 1..]
+                    .iter()
+                    .filter(|w| !FILLER.contains(&w.as_str()))
+                    .cloned()
+                    .collect();
+                if phrase.is_empty() {
+                    None
+                } else {
+                    resolve(&phrase, folders).first().map(|f| f.path.clone())
+                }
+            } else {
+                None
+            };
+            let mut names = Vec::new();
+            let mut current: Vec<String> = Vec::new();
+            for w in names_raw {
+                if matches!(w.to_lowercase().as_str(), "and" | "&") {
+                    names.push(std::mem::take(&mut current));
+                } else {
+                    current.push(w.clone());
+                }
+            }
+            names.push(current);
+            let mut actions = Vec::new();
+            let mut lines = Vec::new();
+            for n in names.iter().take(10) {
+                let name = clean_name(n);
+                let Some(rel) = safe_relative(&name) else {
+                    continue;
+                };
+                let path = parent.clone().unwrap_or_default().join(rel);
+                if folder_exists(&path, ctx.files, folders) {
+                    lines.push(format!("“{}” already exists", path.display()));
+                } else {
+                    lines.push(format!("“{}”", path.display()));
+                    actions.push(ProposedAction::CreateFolder { path });
+                }
+            }
+            if lines.is_empty() {
+                return None;
+            }
+            let text = if actions.is_empty() {
+                format!("Nothing to do: {}.", lines.join(", "))
+            } else {
+                format!(
+                    "I’ll create {} in {}. It’s empty until you move things in — try “move all PDFs into it”.",
+                    lines.join(", "),
+                    ctx.scope
+                )
+            };
+            return Some(plan_reply(
+                ctx,
+                "custom_hierarchy",
+                "Understood your request",
+                "Create folders".into(),
+                text,
+                actions,
+                vec![],
+            ));
+        }
+    }
+    if let Some(at) = first(&["move", "put", "transfer", "relocate", "shift", "send"]) {
+        if neg(at) {
+            return None;
+        }
+        let split = words[at + 1..]
+            .iter()
+            .position(|w| dest_markers.contains(&w.as_str()))?
+            + at
+            + 1;
+        let thing: Vec<String> = words[at + 1..split].to_vec();
+        let dest_raw = &raw[split + 1..];
+        let dest_words: Vec<String> = words[split + 1..].to_vec();
+        if thing.is_empty() || dest_words.is_empty() {
+            return None;
+        }
+        let dest_phrase: Vec<String> = dest_words
+            .iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .cloned()
+            .collect();
+        let (dest_dir, dest_note) = match resolve(&dest_phrase, folders).first() {
+            Some(f) => (f.path.clone(), String::new()),
+            None => {
+                let name = clean_name(dest_raw);
+                let rel = safe_relative(&name)?;
+                let note = format!(
+                    " “{}” doesn’t exist yet, so it will be created.",
+                    rel.display()
+                );
+                (rel, note)
+            }
+        };
+        let criteria = parse_criteria(&thing, folders);
+        if criteria.targets_files() {
+            let mut hits: Vec<&FileCandidate> = ctx
+                .files
+                .iter()
+                .filter(|f| {
+                    matches_file(f, &criteria, ctx.now)
+                        && f.relative_path.parent() != Some(dest_dir.as_path())
+                })
+                .collect();
+            hits.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            let total = hits.len();
+            let mut taken: HashSet<String> = ctx
+                .files
+                .iter()
+                .map(|f| f.relative_path.to_string_lossy().to_lowercase())
+                .collect();
+            let mut actions = Vec::new();
+            let mut sources = Vec::new();
+            let mut skipped = 0;
+            for f in hits.into_iter().take(BATCH) {
+                let Some(name) = f.relative_path.file_name() else {
+                    continue;
+                };
+                let dest = dest_dir.join(name);
+                if !taken.insert(dest.to_string_lossy().to_lowercase()) {
+                    skipped += 1;
+                    continue;
+                }
+                actions.push(ProposedAction::Move {
+                    source: f.id,
+                    destination_relative: dest,
+                });
+                sources.push(Source {
+                    id: f.id.0,
+                    path: f.relative_path.to_string_lossy().into(),
+                    size: f.size,
+                });
+            }
+            let text = if actions.is_empty() {
+                "I found nothing to move that isn’t already there. Nothing changed.".to_string()
+            } else {
+                format!(
+                    "Moving {} ({}) into “{}”.{dest_note}{}{} Uncheck anything to leave it; approve when ready. Moves can be undone from History.",
+                    plural(actions.len(), "file", "files"),
+                    criteria.label,
+                    dest_dir.display(),
+                    if skipped > 0 {
+                        format!(
+                            " {skipped} skipped because a file with that name is already there."
+                        )
+                    } else {
+                        String::new()
+                    },
+                    if total > BATCH {
+                        format!(" This batch covers {BATCH} of {total}; ask again for the rest.")
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            let mut r = plan_reply(
+                ctx,
+                "consolidate_photos",
+                "Understood your request",
+                format!("Move {} → {}", criteria.label, dest_dir.display()),
+                text,
+                actions,
+                sources,
+            );
+            r.remaining_matches = total.saturating_sub(BATCH);
+            r.complete = r.remaining_matches == 0;
+            return Some(r);
+        }
+        let subject: Vec<String> = thing
+            .iter()
+            .filter(|w| !FILLER.contains(&w.as_str()))
+            .cloned()
+            .collect();
+        if let Some(folder) = resolve(&subject, folders)
+            .into_iter()
+            .find(|f| f.path != dest_dir)
+        {
+            let name = folder.path.file_name()?.to_owned();
+            let dest = dest_dir.join(&name);
+            if dest.starts_with(&folder.path) {
+                return Some(reply(
+                    ctx,
+                    "consolidate_photos",
+                    "Understood your request",
+                    "Move folder".into(),
+                    "A folder can’t be moved inside itself. Nothing changed.".into(),
+                ));
+            }
+            if folder_exists(&dest, ctx.files, folders) {
+                return Some(reply(
+                    ctx,
+                    "consolidate_photos",
+                    "Understood your request",
+                    "Move folder".into(),
+                    format!(
+                        "“{}” already exists inside “{}”, so I won’t overwrite it. Nothing changed.",
+                        name.to_string_lossy(),
+                        dest_dir.display()
+                    ),
+                ));
+            }
+            return Some(plan_reply(
+                ctx,
+                "consolidate_photos",
+                "Understood your request",
+                format!(
+                    "Move folder {} → {}",
+                    folder.path.display(),
+                    dest_dir.display()
+                ),
+                format!(
+                    "Move the folder “{}” ({}, {}) into “{}”.{dest_note} Undo is available in History.",
+                    folder.path.display(),
+                    bytes(folder.bytes),
+                    plural(folder.files, "file", "files"),
+                    dest_dir.display()
+                ),
+                vec![ProposedAction::MoveFolder {
+                    source: folder.path.clone(),
+                    destination_relative: dest,
+                }],
+                vec![],
+            ));
+        }
+        let needle = alnum(&subject.join(""));
+        if needle.len() > 2 {
+            if let Some(file) = ctx.files.iter().find(|f| {
+                f.relative_path
+                    .file_name()
+                    .is_some_and(|n| alnum(&n.to_string_lossy()) == needle)
+            }) {
+                let dest = dest_dir.join(file.relative_path.file_name()?);
+                if folder_exists(&dest, ctx.files, folders) {
+                    return Some(reply(
+                        ctx,
+                        "consolidate_photos",
+                        "Understood your request",
+                        "Move file".into(),
+                        format!(
+                            "“{}” already exists there. Nothing changed.",
+                            dest.display()
+                        ),
+                    ));
+                }
+                return Some(plan_reply(
+                    ctx,
+                    "consolidate_photos",
+                    "Understood your request",
+                    format!(
+                        "Move {} → {}",
+                        file.relative_path.display(),
+                        dest_dir.display()
+                    ),
+                    format!(
+                        "Move “{}” into “{}”.{dest_note}",
+                        file.relative_path.display(),
+                        dest_dir.display()
+                    ),
+                    vec![ProposedAction::Move {
+                        source: file.id,
+                        destination_relative: dest,
+                    }],
+                    vec![Source {
+                        id: file.id.0,
+                        path: file.relative_path.to_string_lossy().into(),
+                        size: file.size,
+                    }],
+                ));
+            }
+        }
+        return Some(reply(
+            ctx,
+            "consolidate_photos",
+            "Looked for what to move",
+            "Nothing matched".into(),
+            format!(
+                "I couldn’t find “{}” to move. Try its exact name, or describe it (for example “all PDFs” or “photos older than a year”).",
+                thing.join(" ")
+            ),
+        ));
+    }
+    if has(words, &["edit", "modify", "rewrite", "append", "prepend"])
+        && !has(
+            words,
+            &[
+                "extension",
+                "extensions",
+                "name",
+                "names",
+                "permission",
+                "permissions",
+            ],
+        )
+    {
+        return Some(reply(ctx, "clarify_request", "Explained a limit", "Content editing is not supported".into(), "I can move, rename, copy, create folders, change permissions and send things to the Trash — but I don’t edit what’s inside files. Tell me which of those you’d like.".into()));
+    }
+    None
+}
+
+/// Prompt asking the local model to restate a request as one plain command the engine parses.
+pub fn rewrite_prompt(request: &str, files: &[FileCandidate]) -> String {
+    let folders = folders_of(files);
+    let mut names: Vec<&Folder> = folders
+        .iter()
+        .filter(|f| f.path.components().count() <= 3)
+        .collect();
+    names.sort_by_key(|f| std::cmp::Reverse(f.bytes));
+    let known: Vec<String> = names
+        .iter()
+        .take(60)
+        .map(|f| f.path.to_string_lossy().into_owned())
+        .collect();
+    let request: String = request
+        .rsplit("User follow-up:")
+        .next()
+        .unwrap_or(request)
+        .chars()
+        .take(400)
+        .collect();
+    format!(
+        "Rewrite the USER REQUEST as ONE short English command for a file assistant. Output only the command on one line, nothing else.\n\
+Allowed command forms (use exactly these shapes):\n\
+delete the <folder> folder\n\
+delete all <type> files older than <N> months\n\
+delete the <N> biggest files\n\
+move <thing> into <folder>\n\
+rename <folder or file> to <new name>\n\
+create a folder called <name> in <folder>\n\
+organize by type\n\
+organize by date\n\
+what is taking the most space\n\
+find <words>\n\
+list all my projects\n\
+Rules: when the user names an existing folder, copy its exact path from KNOWN_FOLDERS (fix typos and spacing). If the request cannot be expressed with these forms, output UNCLEAR.\n\
+KNOWN_FOLDERS: {}\n\
+USER REQUEST: {}",
+        serde_json::to_string(&known).unwrap_or_default(),
+        serde_json::to_string(&request).unwrap_or_default(),
     )
+}
+/// First usable line of a model's rewrite, or `None` for UNCLEAR/empty output.
+pub fn clean_rewrite(text: &str) -> Option<String> {
+    let mut text = text.to_string();
+    while let Some(start) = text.find("<think>") {
+        let end = text[start..]
+            .find("</think>")
+            .map_or(text.len(), |e| start + e + 8);
+        text.replace_range(start..end, "");
+    }
+    let line = text
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_matches(|c| matches!(c, '"' | '`' | '\'' | '“' | '”'))
+                .trim()
+        })
+        .find(|l| !l.is_empty())?
+        .to_string();
+    if line.to_uppercase().starts_with("UNCLEAR") || line.len() > 300 {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+/// Drops a trailing purpose clause ("…, so I can remove those") that would pollute a search.
+fn strip_purpose(words: Vec<String>, raw: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let cut = words.iter().enumerate().position(|(i, w)| {
+        i > 1
+            && (w == "so"
+                || w == "because"
+                || w == "since"
+                || (w == "in" && words.get(i + 1).is_some_and(|n| n == "order")))
+            || (i > 1
+                && w == "to"
+                && words.get(i + 1).is_some_and(|n| n == "be")
+                && words.get(i + 2).is_some_and(|n| n == "able"))
+    });
+    match cut {
+        Some(at) => {
+            let mut words = words;
+            let mut raw = raw;
+            words.truncate(at);
+            raw.truncate(at.min(raw.len()));
+            (words, raw)
+        }
+        None => (words, raw),
+    }
+}
+/// Folder names that mean the same thing to people: a launcher "profile" is an "instance".
+fn concept_names(noun: &str) -> Option<&'static [&'static str]> {
+    Some(match noun {
+        "profile" | "profiles" | "instance" | "instances" | "modpack" | "modpacks" | "pack"
+        | "packs" => &["instances", "profiles", "modpacks"],
+        "world" | "worlds" | "save" | "saves" => &["saves", "worlds"],
+        "backup" | "backups" => &["backups", "backup"],
+        "mod" | "mods" => &["mods"],
+        "resourcepack" | "resourcepacks" | "texturepack" | "texturepacks" => &["resourcepacks"],
+        "screenshot" | "screenshots" => &["screenshots"],
+        "download" | "downloads" => &["downloads"],
+        "cache" | "caches" => &["cache", "caches"],
+        "log" | "logs" => &["logs"],
+        "template" | "templates" => &["templates", "template"],
+        "plugin" | "plugins" => &["plugins"],
+        _ => return None,
+    })
+}
+const APP_WORDS: &[&str] = &[
+    "modrinth",
+    "curseforge",
+    "minecraft",
+    "prism",
+    "prismlauncher",
+    "atlauncher",
+    "launcher",
+    "ftb",
+    "technic",
+    "forge",
+    "fabric",
+    "steam",
+    "epic",
+    "game",
+    "games",
+    "gaming",
+];
+const LIST_NOISE: &[&str] = &[
+    "list",
+    "show",
+    "find",
+    "display",
+    "give",
+    "see",
+    "check",
+    "look",
+    "search",
+    "all",
+    "every",
+    "each",
+    "my",
+    "me",
+    "the",
+    "of",
+    "on",
+    "in",
+    "computer",
+    "mac",
+    "device",
+    "disk",
+    "that",
+    "i",
+    "have",
+    "got",
+    "own",
+    "which",
+    "what",
+    "where",
+    "are",
+    "is",
+    "there",
+    "possible",
+    "files",
+    "file",
+    "folder",
+    "folders",
+    "directory",
+    "directories",
+    "named",
+    "called",
+    "delete",
+    "remove",
+    "trash",
+    "erase",
+    "get",
+    "rid",
+    "those",
+    "them",
+    "these",
+    "and",
+    "or",
+    ",",
+    "to",
+    "for",
+    "please",
+    "can",
+    "you",
+    "could",
+    "see",
+];
+/// "list all my modrinth profiles": resolve the noun to real folders (launcher profiles live in an
+/// `Instances` folder) and list what is inside, ready to pick from.
+/// Splits "instances that are not the 26.2 version" into the noun part and a keep/drop filter.
+fn split_filter(words: &[String]) -> (Vec<String>, Option<(Vec<String>, bool)>) {
+    let negative = [
+        "not",
+        "except",
+        "excluding",
+        "besides",
+        "without",
+        "aren't",
+        "isn't",
+        "non",
+        "other",
+    ];
+    let marker = words.iter().position(|w| negative.contains(&w.as_str()));
+    let stop = [
+        "than",
+        "the",
+        "a",
+        "an",
+        "version",
+        "versions",
+        "one",
+        "ones",
+        "of",
+        "any",
+        "those",
+        "that",
+        "are",
+        "is",
+        "have",
+        "with",
+        "on",
+        "in",
+        "running",
+        "using",
+        "mc",
+        "minecraft",
+        "for",
+        "or",
+        "and",
+        ",",
+        "to",
+        "it",
+        "they",
+        "them",
+    ];
+    if let Some(at) = marker {
+        let mut terms: Vec<String> = words[at + 1..]
+            .iter()
+            .filter(|w| {
+                !stop.contains(&w.as_str())
+                    && (w.chars().any(|c| c.is_ascii_digit()) || w.len() >= 3)
+            })
+            .cloned()
+            .collect();
+        // Versions are what people filter on; when numbers are present ignore stray words.
+        if terms
+            .iter()
+            .any(|t| t.contains('.') && t.chars().any(|c| c.is_ascii_digit()))
+        {
+            terms.retain(|t| t.contains('.') && t.chars().any(|c| c.is_ascii_digit()));
+        } else if terms.iter().any(|t| t.chars().any(|c| c.is_ascii_digit())) {
+            terms.retain(|t| t.chars().any(|c| c.is_ascii_digit()));
+        }
+        terms.dedup();
+        terms.truncate(4);
+        if !terms.is_empty() {
+            // The noun part also drops the "that are" lead-in.
+            let mut head = words[..at].to_vec();
+            while head.last().is_some_and(|w| {
+                matches!(
+                    w.as_str(),
+                    "that" | "which" | "are" | "is" | "who" | "whose"
+                )
+            }) {
+                head.pop();
+            }
+            return (head, Some((terms, true)));
+        }
+    }
+    let version_terms: Vec<String> = words
+        .iter()
+        .filter(|w| w.contains('.') && w.chars().any(|c| c.is_ascii_digit()) && !w.starts_with('.'))
+        .cloned()
+        .collect();
+    if !version_terms.is_empty()
+        && has(
+            words,
+            &["version", "versions", "only", "that", "which", "with"],
+        )
+    {
+        let at = words
+            .iter()
+            .position(|w| matches!(w.as_str(), "that" | "which" | "with" | "only" | "version"))
+            .unwrap_or(words.len());
+        return (
+            words[..at.min(words.len())].to_vec(),
+            Some((version_terms, false)),
+        );
+    }
+    (words.to_vec(), None)
+}
+/// The Minecraft version a launcher instance/profile folder declares, read from its metadata
+/// (CurseForge, Prism/MultiMC, Modrinth or a modpack manifest). Read-only and bounded.
+fn instance_version(dir: &Path) -> Option<String> {
+    let quoted_after = |text: &str, key: &str, from: usize| -> Option<String> {
+        let at = text[from..].find(key)? + from + key.len();
+        let rest = &text[at..];
+        let open = rest.find('"')?;
+        let close = rest[open + 1..].find('"')?;
+        // Skip the colon/space between key and value: the first quote after the key opens the value
+        // unless it belongs to the closing quote of the key itself.
+        let value = &rest[open + 1..open + 1 + close];
+        if value.chars().all(|c| c == ':' || c == ' ') {
+            let rest2 = &rest[open + 1 + close + 1..];
+            let o2 = rest2.find('"')?;
+            let c2 = rest2[o2 + 1..].find('"')?;
+            Some(rest2[o2 + 1..o2 + 1 + c2].to_string())
+        } else {
+            Some(value.to_string())
+        }
+    };
+    let read = |name: &str| -> Option<String> {
+        let path = dir.join(name);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()
+    };
+    if let Some(t) = read("minecraftinstance.json")
+        && let Some(v) = quoted_after(&t, "\"gameVersion\"", 0)
+    {
+        return Some(v);
+    }
+    if let Some(t) = read("profile.json")
+        && let Some(v) = quoted_after(&t, "\"game_version\"", 0)
+    {
+        return Some(v);
+    }
+    if let Some(t) = read("mmc-pack.json")
+        && let Some(at) = t.find("\"net.minecraft\"")
+        && let Some(v) = quoted_after(&t, "\"version\"", at)
+    {
+        return Some(v);
+    }
+    if let Some(t) = read("manifest.json")
+        && let Some(at) = t.find("\"minecraft\"")
+        && let Some(v) = quoted_after(&t, "\"version\"", at)
+    {
+        return Some(v);
+    }
+    None
+}
+fn list_named(
+    ctx: &Ctx,
+    words: &[String],
+    folders: &[Folder],
+    concept_only: bool,
+    remove: bool,
+) -> Option<Investigation> {
+    let (words, filter) = split_filter(words);
+    let words = &words[..];
+    let app: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|w| APP_WORDS.contains(w))
+        .collect();
+    let nouns: Vec<&String> = words
+        .iter()
+        .filter(|w| {
+            !LIST_NOISE.contains(&w.as_str())
+                && !APP_WORDS.contains(&w.as_str())
+                && !FILLER.contains(&w.as_str())
+        })
+        .collect();
+    if nouns.is_empty() || nouns.len() > 3 {
+        return None;
+    }
+    let mut containers: Vec<&Folder> = Vec::new();
+    for noun in nouns {
+        let names: Vec<String> = match concept_names(noun) {
+            Some(n) => n.iter().map(|s| s.to_string()).collect(),
+            None if concept_only => continue,
+            None => vec![noun.trim_end_matches('s').to_string(), noun.clone()],
+        };
+        // Names are in priority order: launcher "instances" beat generic "profiles" folders
+        // that mods keep deep inside each instance.
+        let mut found: Vec<&Folder> = Vec::new();
+        for name in &names {
+            found = folders
+                .iter()
+                .filter(|f| f.name_norm == alnum(name))
+                .collect();
+            if !found.is_empty() {
+                break;
+            }
+        }
+        if !app.is_empty() {
+            let narrowed: Vec<&Folder> = found
+                .iter()
+                .copied()
+                .filter(|f| {
+                    let path = alnum(&f.path.to_string_lossy());
+                    app.iter().any(|a| path.contains(a))
+                })
+                .collect();
+            if !narrowed.is_empty() {
+                found = narrowed;
+            }
+        }
+        containers.extend(found);
+    }
+    containers.sort_by(|a, b| a.path.cmp(&b.path));
+    containers.dedup_by(|a, b| a.path == b.path);
+    // A container living inside another container is part of its contents, not a separate list.
+    let all_paths: Vec<PathBuf> = containers.iter().map(|c| c.path.clone()).collect();
+    containers.retain(|c| {
+        !all_paths
+            .iter()
+            .any(|o| *o != c.path && c.path.starts_with(o))
+    });
+    if containers.is_empty() {
+        return None;
+    }
+    let mut picks: Vec<FolderTarget> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut kept_items: Vec<ListItem> = Vec::new();
+    let mut unknown = 0usize;
+    let text = String::new();
+    for container in containers.iter().take(8) {
+        let mut children: Vec<&Folder> = folders
+            .iter()
+            .filter(|f| f.path.parent() == Some(container.path.as_path()))
+            .collect();
+        children.sort_by_key(|f| std::cmp::Reverse(f.bytes));
+        if children.is_empty() {
+            continue;
+        }
+
+        for child in children.iter().take(60) {
+            let name = child
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let version = ctx
+                .root
+                .and_then(|root| instance_version(&root.join(&child.path)));
+            if version.is_none() {
+                unknown += 1;
+            }
+            let haystack = format!(
+                "{} {}",
+                name.to_lowercase(),
+                version.clone().unwrap_or_default().to_lowercase()
+            );
+            let matches_filter = filter.as_ref().is_none_or(|(terms, negate)| {
+                let hit = terms.iter().any(|t| haystack.contains(t.as_str()));
+                hit != *negate
+            });
+            let label = match &version {
+                Some(v) => format!("{name} (Minecraft {v})"),
+                None => name.clone(),
+            };
+            if matches_filter {
+                if picks.len() < FOLDER_BATCH {
+                    let mut t = target(child);
+                    t.note = version.as_ref().map(|v| format!("Minecraft {v}"));
+                    picks.push(t);
+                }
+            } else {
+                let mut item = folder_item(child);
+                item.note = version.as_ref().map(|v| format!("Minecraft {v} · kept"));
+                kept_items.push(item);
+                kept.push(label);
+            }
+        }
+    }
+    {
+        let paths: Vec<String> = picks.iter().map(|p| p.path.clone()).collect();
+        picks.retain(|p| {
+            !paths
+                .iter()
+                .any(|o| *o != p.path && p.path.starts_with(&format!("{o}/")))
+        });
+    }
+    if picks.is_empty() {
+        if filter.is_some() && !kept.is_empty() {
+            return Some(reply(
+                ctx,
+                "find_filename",
+                "Filtered the folders",
+                format!("Every match was kept: {}", kept.join(", ")),
+                format!(
+                    "Nothing to remove: every one of them matches what you wanted to keep ({}). Nothing changed.",
+                    kept.join(", ")
+                ),
+            ));
+        }
+        return None;
+    }
+    let container_name = containers[0]
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let filter_note = match &filter {
+        Some((terms, true)) => format!(
+            " Keeping {} (matching {}).",
+            if kept.is_empty() {
+                "none".to_string()
+            } else {
+                kept.join(", ")
+            },
+            terms.join(" / ")
+        ),
+        Some((terms, false)) => format!(" Only those matching {}.", terms.join(" / ")),
+        None => String::new(),
+    };
+    let coverage = if filter.is_some() && unknown > 0 {
+        format!(
+            " I could read the game version for {} of {}; for the rest I only had the folder name, so double-check those.",
+            picks.len() + kept.len() - unknown.min(picks.len() + kept.len()),
+            picks.len() + kept.len()
+        )
+    } else {
+        String::new()
+    };
+    let total: u64 = picks.iter().map(|p| p.bytes).sum();
+    let mut r = reply(
+        ctx,
+        if remove {
+            "trash_named_files"
+        } else {
+            "find_filename"
+        },
+        "Looked for matching folders",
+        format!(
+            "Matched “{}” to {}",
+            words.join(" "),
+            containers
+                .iter()
+                .take(3)
+                .map(|c| c.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        String::new(),
+    );
+    if !kept_items.is_empty() {
+        r.sections.push(Section {
+            title: "Kept (matches what you wanted to keep)".into(),
+            items: std::mem::take(&mut kept_items),
+        });
+    }
+    r.folders = picks;
+    if remove && filter.is_some() {
+        r.proposal.rationale = format!(
+            "{} of the folders in “{container_name}” ({}) are ready for the Trash — each moves whole and stays recoverable.{filter_note}{coverage}{text}\n\nUncheck anything you want to keep. Nothing happens until you approve.",
+            r.folders.len(),
+            bytes(total),
+        );
+    } else {
+        r.pick = true;
+        r.proposal.rationale = format!(
+            "Found {} in {} — in this folder they are called “{container_name}”:{filter_note}{coverage}{text}\n\nTick the ones to move to the Trash below, or tell me which.",
+            plural(r.folders.len(), "match", "matches"),
+            ctx.scope,
+        );
+    }
+    Some(r)
+}
+
+const MAX_HASH_BYTES: u64 = 1 << 30;
+const MAX_HASHED_FILES: usize = 20_000;
+/// Rename many files by rule: change extensions, tidy name style, or find and remove duplicates.
+fn bulk_ops(
+    ctx: &Ctx,
+    raw: &[String],
+    words: &[String],
+    folders: &[Folder],
+) -> Option<Investigation> {
+    let denies = words.iter().enumerate().any(|(i, w)| {
+        matches!(
+            w.as_str(),
+            "change"
+                | "convert"
+                | "rename"
+                | "switch"
+                | "turn"
+                | "make"
+                | "replace"
+                | "remove"
+                | "delete"
+                | "lowercase"
+                | "find"
+                | "show"
+                | "list"
+                | "clean"
+                | "get"
+        ) && negated(words, i)
+    });
+    if denies {
+        return None;
+    }
+    // Duplicates: identical content, decided by hashing files of equal size.
+    if has(
+        words,
+        &["duplicate", "duplicates", "duplicated", "dupes", "dupe"],
+    ) && has(
+        words,
+        &[
+            "delete", "remove", "trash", "clean", "find", "show", "list", "get", "erase", "detect",
+        ],
+    ) {
+        let remove = has(
+            words,
+            &["delete", "remove", "trash", "clean", "erase", "get"],
+        );
+        return Some(duplicates(ctx, words, folders, remove));
+    }
+    let names_talk = has(words, &["names", "filenames", "filename"]);
+    // Extension change: "change all .txt files to .md".
+    let action = has(
+        words,
+        &["change", "convert", "rename", "switch", "turn", "make"],
+    );
+    if action && has(words, &["extension", "extensions", "files"]) {
+        let to_at = words
+            .iter()
+            .rposition(|w| matches!(w.as_str(), "to" | "into" | "as"));
+        if let Some(at) = to_at {
+            let target = words
+                .get(at + 1)
+                .map(|w| w.trim_start_matches('.').to_lowercase())
+                .unwrap_or_default();
+            let head: Vec<String> = words[..at].to_vec();
+            let c = parse_criteria(&head, folders);
+            let target_is_ext = !target.is_empty()
+                && target.len() <= 10
+                && target.chars().all(|ch| ch.is_ascii_alphanumeric())
+                && (words[at + 1].starts_with('.')
+                    || has(words, &["extension", "extensions"])
+                    || KNOWN_EXTS.contains(&target.as_str()));
+            if !c.exts.is_empty()
+                && target_is_ext
+                && kind_exts(&target).is_none_or(|_| words[at + 1].starts_with('.'))
+                && !names_talk
+            {
+                return Some(change_extensions(ctx, &c, &target));
+            }
+        }
+    }
+    // Name styles and find/replace inside file names.
+    if names_talk
+        && has(
+            words,
+            &[
+                "rename",
+                "change",
+                "make",
+                "convert",
+                "replace",
+                "remove",
+                "delete",
+                "lowercase",
+                "fix",
+                "clean",
+                "normalize",
+                "normalise",
+                "turn",
+            ],
+        )
+    {
+        return bulk_rename(ctx, raw, words, folders);
+    }
+    None
+}
+const KNOWN_EXTS: &[&str] = &[
+    "txt", "md", "markdown", "json", "csv", "html", "htm", "xml", "yaml", "yml", "log", "rtf",
+    "doc", "docx", "pdf", "jpg", "jpeg", "png", "gif", "webp", "heic", "mp4", "mov", "mp3", "wav",
+    "zip", "js", "ts", "py", "rs", "swift", "java", "c", "cpp", "h", "sh", "bak", "old", "tmp",
+    "dat", "bin",
+];
+fn change_extensions(ctx: &Ctx, c: &Criteria, target: &str) -> Investigation {
+    let occupied: HashSet<String> = ctx
+        .files
+        .iter()
+        .map(|f| f.relative_path.to_string_lossy().to_lowercase())
+        .collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut actions = Vec::new();
+    let mut sources = Vec::new();
+    let (mut collisions, mut eligible) = (0usize, 0usize);
+    let mut sorted: Vec<&FileCandidate> = ctx
+        .files
+        .iter()
+        .filter(|f| matches_file(f, c, ctx.now))
+        .collect();
+    sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    for f in sorted {
+        let current = f
+            .relative_path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if current == target {
+            continue;
+        }
+        eligible += 1;
+        let dest = f.relative_path.with_extension(target);
+        let key = dest.to_string_lossy().to_lowercase();
+        if occupied.contains(&key) || !taken.insert(key) {
+            collisions += 1;
+            continue;
+        }
+        if actions.len() < BATCH {
+            let Some(name) = dest.file_name() else {
+                continue;
+            };
+            actions.push(ProposedAction::Rename {
+                source: f.id,
+                new_name: name.to_string_lossy().into_owned(),
+            });
+            sources.push(Source {
+                id: f.id.0,
+                path: f.relative_path.to_string_lossy().into(),
+                size: f.size,
+            });
+        }
+    }
+    let text = if actions.is_empty() {
+        format!(
+            "Nothing to change: no {} would get a new .{target} extension{}.",
+            if c.label.is_empty() {
+                "matching files"
+            } else {
+                c.label.as_str()
+            },
+            if collisions > 0 {
+                format!(" without colliding with an existing name ({collisions} would)")
+            } else {
+                String::new()
+            }
+        )
+    } else {
+        format!(
+            "Renaming {} ({}) to .{target}. Only the name changes — the contents stay exactly as they are, so this does not convert the file format.{}{} Undo is available in History.",
+            plural(actions.len(), "file", "files"),
+            if c.label.is_empty() {
+                "matching files".to_string()
+            } else {
+                c.label.clone()
+            },
+            if collisions > 0 {
+                format!(" {collisions} skipped because that name already exists.")
+            } else {
+                String::new()
+            },
+            if eligible > BATCH {
+                format!(" This batch covers {BATCH} of {eligible}; ask again for the rest.")
+            } else {
+                String::new()
+            },
+        )
+    };
+    let mut r = plan_reply(
+        ctx,
+        "change_extensions",
+        "Understood your request",
+        format!("Change extensions to .{target}"),
+        text,
+        actions,
+        sources,
+    );
+    r.remaining_matches = eligible.saturating_sub(BATCH);
+    r.complete = r.remaining_matches == 0;
+    r
+}
+fn bulk_rename(
+    ctx: &Ctx,
+    raw: &[String],
+    words: &[String],
+    folders: &[Folder],
+) -> Option<Investigation> {
+    // Which transformation?
+    #[derive(Clone)]
+    enum Op {
+        Lower,
+        Spaces(&'static str),
+        Replace(String, String),
+        Remove(String),
+    }
+    let op = if has(words, &["lowercase"]) || contains_seq(words, &["lower", "case"]) {
+        Op::Lower
+    } else if has(words, &["spaces", "space"]) && has(words, &["underscore", "underscores"]) {
+        Op::Spaces("_")
+    } else if has(words, &["spaces", "space"])
+        && has(words, &["dash", "dashes", "hyphen", "hyphens"])
+    {
+        Op::Spaces("-")
+    } else if has(words, &["spaces", "space"]) && has(words, &["remove", "delete", "without"]) {
+        Op::Spaces("")
+    } else if let Some(at) = words.iter().position(|w| w == "replace") {
+        let with_at = words[at..].iter().position(|w| w == "with")? + at;
+        let end = words[with_at..]
+            .iter()
+            .position(|w| matches!(w.as_str(), "in" | "from" | "within" | "across"))?
+            .checked_add(with_at)
+            .unwrap_or(words.len());
+        let from = clean_name(&raw[at + 1..with_at]);
+        let to = clean_name(&raw[with_at + 1..end.min(raw.len())]);
+        if from.is_empty() {
+            return None;
+        }
+        Op::Replace(from, to)
+    } else if let Some(at) = words
+        .iter()
+        .position(|w| matches!(w.as_str(), "remove" | "delete"))
+    {
+        let end = words[at..]
+            .iter()
+            .position(|w| matches!(w.as_str(), "from" | "in"))?
+            + at;
+        let text = clean_name(&raw[at + 1..end.min(raw.len())]);
+        let text = text
+            .trim_start_matches("the word ")
+            .trim_start_matches("word ")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return None;
+        }
+        Op::Remove(text)
+    } else {
+        return None;
+    };
+    let c = parse_criteria(words, folders);
+    let scoped = c.targets_files() || c.in_folder.is_some();
+    let occupied: HashSet<String> = ctx
+        .files
+        .iter()
+        .map(|f| f.relative_path.to_string_lossy().to_lowercase())
+        .collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let (mut actions, mut sources) = (Vec::new(), Vec::new());
+    let (mut collisions, mut changed) = (0usize, 0usize);
+    let mut sorted: Vec<&FileCandidate> = ctx
+        .files
+        .iter()
+        .filter(|f| !never_touch(&f.relative_path) && (!scoped || matches_file(f, &c, ctx.now)))
+        .collect();
+    sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    for f in sorted {
+        let Some(name) = f
+            .relative_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+            _ => (name.clone(), String::new()),
+        };
+        let new_stem = match &op {
+            Op::Lower => stem.to_lowercase(),
+            Op::Spaces(with) => stem.replace(' ', with),
+            Op::Replace(from, to) => replace_ci(&stem, from, to),
+            Op::Remove(text) => {
+                let cleaned = replace_ci(&stem, text, "")
+                    .replace("()", "")
+                    .replace("( )", "");
+                cleaned
+                    .split([' ', '-', '_'])
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(if stem.contains(' ') {
+                        " "
+                    } else if stem.contains('_') {
+                        "_"
+                    } else {
+                        "-"
+                    })
+            }
+        };
+        let new_ext = if matches!(op, Op::Lower) {
+            ext.to_lowercase()
+        } else {
+            ext.clone()
+        };
+        let new_name = format!("{new_stem}{new_ext}");
+        if new_stem.is_empty() || new_name == name {
+            continue;
+        }
+        changed += 1;
+        let dest = f.relative_path.with_file_name(&new_name);
+        let key = dest.to_string_lossy().to_lowercase();
+        // A case-only rename maps to itself on case-insensitive volumes; treat the file's own key as free.
+        let own = f.relative_path.to_string_lossy().to_lowercase();
+        if (key != own && occupied.contains(&key)) || !taken.insert(key) {
+            collisions += 1;
+            continue;
+        }
+        if actions.len() < BATCH {
+            actions.push(ProposedAction::Rename {
+                source: f.id,
+                new_name,
+            });
+            sources.push(Source {
+                id: f.id.0,
+                path: f.relative_path.to_string_lossy().into(),
+                size: f.size,
+            });
+        }
+    }
+    let what = match &op {
+        Op::Lower => "lowercase names".to_string(),
+        Op::Spaces(w) => format!("spaces replaced by “{w}”"),
+        Op::Replace(a, b) => format!("“{a}” replaced by “{b}”"),
+        Op::Remove(t) => format!("“{t}” removed from names"),
+    };
+    let text = if actions.is_empty() {
+        format!("No file names would change ({what}). Nothing changed.")
+    } else {
+        format!(
+            "Renaming {} — {what}. Extensions and contents stay as they are.{}{} Undo is available in History.",
+            plural(actions.len(), "file", "files"),
+            if collisions > 0 {
+                format!(" {collisions} skipped to avoid a name clash.")
+            } else {
+                String::new()
+            },
+            if changed > BATCH {
+                format!(" This batch covers {BATCH} of {changed}; ask again for the rest.")
+            } else {
+                String::new()
+            }
+        )
+    };
+    let mut r = plan_reply(
+        ctx,
+        "normalize_names",
+        "Understood your request",
+        format!("Rename files: {what}"),
+        text,
+        actions,
+        sources,
+    );
+    r.remaining_matches = changed.saturating_sub(BATCH);
+    r.complete = r.remaining_matches == 0;
+    Some(r)
+}
+fn replace_ci(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
+    }
+    let (lower, needle) = (text.to_lowercase(), from.to_lowercase());
+    if lower.len() != text.len() {
+        return text.replace(from, to);
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(&needle) {
+        out.push_str(&text[at..at + found]);
+        out.push_str(to);
+        at += found + needle.len();
+    }
+    out.push_str(&text[at..]);
+    out
+}
+fn hash_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+/// Identical files (same size, then same SHA-256). The oldest copy, then the shortest path, is kept.
+fn duplicates(ctx: &Ctx, words: &[String], folders: &[Folder], remove: bool) -> Investigation {
+    let Some(root) = ctx.root else {
+        return reply(
+            ctx,
+            "exact_duplicates",
+            "Looked for duplicates",
+            "No folder access".into(),
+            "I need access to the folder on disk to compare file contents.".into(),
+        );
+    };
+    let c = parse_criteria(words, folders);
+    let mut by_size: BTreeMap<u64, Vec<&FileCandidate>> = BTreeMap::new();
+    for f in ctx.files.iter().filter(|f| {
+        f.size > 0
+            && !never_touch(&f.relative_path)
+            && matches_file(
+                f,
+                &Criteria {
+                    older_days: None,
+                    min_bytes: None,
+                    top_n: None,
+                    name_terms: vec![],
+                    excludes: c.excludes.clone(),
+                    ..Criteria {
+                        exts: c.exts.clone(),
+                        screenshots: c.screenshots,
+                        junk: c.junk,
+                        in_folder: c.in_folder.clone(),
+                        ..Default::default()
+                    }
+                },
+                ctx.now,
+            )
+    }) {
+        by_size.entry(f.size).or_default().push(f);
+    }
+    let (mut read, mut hashed, mut skipped_budget) = (0u64, 0usize, false);
+    let mut groups: Vec<Vec<&FileCandidate>> = Vec::new();
+    for (size, same) in by_size.into_iter().rev().filter(|(_, v)| v.len() > 1) {
+        let mut by_hash: BTreeMap<String, Vec<&FileCandidate>> = BTreeMap::new();
+        for f in same {
+            if read + size > MAX_HASH_BYTES || hashed >= MAX_HASHED_FILES {
+                skipped_budget = true;
+                continue;
+            }
+            if let Some(h) = hash_file(&root.join(&f.relative_path)) {
+                read += size;
+                hashed += 1;
+                by_hash.entry(h).or_default().push(f);
+            }
+        }
+        groups.extend(by_hash.into_values().filter(|g| g.len() > 1));
+    }
+    for g in &mut groups {
+        g.sort_by(|a, b| {
+            a.modified
+                .cmp(&b.modified)
+                .then(
+                    a.relative_path
+                        .components()
+                        .count()
+                        .cmp(&b.relative_path.components().count()),
+                )
+                .then(a.relative_path.cmp(&b.relative_path))
+        });
+    }
+    groups.sort_by_key(|g| std::cmp::Reverse(g[0].size * (g.len() as u64 - 1)));
+    let redundant: Vec<&FileCandidate> =
+        groups.iter().flat_map(|g| g[1..].iter().copied()).collect();
+    let reclaim: u64 = redundant.iter().map(|f| f.size).sum();
+    let head = if groups.is_empty() {
+        "I compared the contents of every file that shares a size with another and found no exact duplicates.".to_string()
+    } else {
+        format!(
+            "Found {} in {} — {} would be freed by keeping one copy of each (the oldest, at the shortest path).",
+            plural(redundant.len(), "duplicate file", "duplicate files"),
+            plural(groups.len(), "group", "groups"),
+            bytes(reclaim)
+        )
+    };
+    let mut r = reply(
+        ctx,
+        "exact_duplicates",
+        "Compared file contents",
+        format!("Hashed {hashed} files ({}) of equal size", bytes(read)),
+        head,
+    );
+    if skipped_budget {
+        r.proposal
+            .rationale
+            .push_str(" The comparison stopped at its read budget, so there may be more.");
+    }
+    for g in groups.iter().take(20) {
+        r.sections.push(Section {
+            title: format!("{} identical copies · {} each", g.len(), bytes(g[0].size)),
+            items: g
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ListItem {
+                    note: Some(if i == 0 {
+                        "keep".into()
+                    } else {
+                        "duplicate".into()
+                    }),
+                    ..file_item(f)
+                })
+                .collect(),
+        });
+    }
+    if remove && !redundant.is_empty() {
+        for f in redundant.iter().take(BATCH) {
+            r.proposal
+                .actions
+                .push(ProposedAction::Trash { source: f.id });
+            r.sources.push(Source {
+                id: f.id.0,
+                path: f.relative_path.to_string_lossy().into(),
+                size: f.size,
+            });
+        }
+        r.proposal.rationale.push_str(" The extra copies are ready for the Trash; the originals stay. Uncheck any you want to keep.");
+        r.remaining_matches = redundant.len().saturating_sub(BATCH);
+    }
+    r.examined = hashed;
+    r
+}
+
+const PROJECT_KIND_WORDS: &[(&str, &str)] = &[
+    ("git", "Git"),
+    ("node", "Node"),
+    ("npm", "Node"),
+    ("javascript", "Node"),
+    ("rust", "Rust"),
+    ("cargo", "Rust"),
+    ("python", "Python"),
+    ("gradle", "Gradle"),
+    ("java", "Gradle"),
+    ("web", "Web"),
+    ("html", "Web"),
+    ("flutter", "Flutter"),
+    ("xcode", "Xcode"),
+    ("swift", "Swift"),
+    ("php", "PHP"),
+    ("ruby", "Ruby"),
+    ("go", "Go"),
+];
+/// Follow-ups that only make sense with the previous request in mind (“why no size?”, “measure
+/// them”, “only the Rust ones”, “biggest first”, “delete them”). `previous` is the last request that
+/// produced a listing.
+pub fn follow_up(
+    request: &str,
+    previous: &str,
+    files: &[FileCandidate],
+    scope: &str,
+    now: i64,
+    root: Option<&Path>,
+) -> Option<Investigation> {
+    let words = tokens(request.rsplit("User follow-up:").next().unwrap_or(request));
+    if words.is_empty() || words.len() > 14 {
+        return None;
+    }
+    let ctx = Ctx {
+        files,
+        scope,
+        now,
+        root,
+    };
+    let projects = wants_projects(previous);
+    let size_talk = has(
+        &words,
+        &[
+            "size", "sizes", "big", "large", "heavy", "weigh", "weighs", "heavy",
+        ],
+    );
+    let questioning = has(
+        &words,
+        &[
+            "why", "come", "missing", "no", "without", "blank", "unknown", "empty", "don't",
+            "dont", "not", "some",
+        ],
+    );
+    let pronoun = has(
+        &words,
+        &[
+            "them", "those", "these", "it", "ones", "all", "each", "they",
+        ],
+    );
+    if size_talk
+        && questioning
+        && !has(
+            &words,
+            &[
+                "biggest", "largest", "heaviest", "sort", "delete", "remove", "first",
+            ],
+        )
+    {
+        return Some(reply(
+            &ctx,
+            "analyze_storage",
+            "Explained missing sizes",
+            "Sizes come from Tidy's index".into(),
+            "Sizes come from Tidy's saved index. A folder shows none when it was skipped by an older scan (Git repositories weren't indexed before) or hasn't been scanned yet. Say “measure them” and I'll read their sizes straight from disk now, or press Rescan in Storage to index them properly.".into(),
+        ));
+    }
+    let measure_verbs = has(
+        &words,
+        &[
+            "measure",
+            "calculate",
+            "compute",
+            "get",
+            "show",
+            "add",
+            "fill",
+            "find",
+            "give",
+            "check",
+            "read",
+            "take",
+            "figure",
+        ],
+    );
+    if projects {
+        let root = root?;
+        let opts_for = |mutate: &dyn Fn(&mut ProjectOpts)| {
+            let mut o = ProjectOpts::default();
+            mutate(&mut o);
+            list_projects_with(root, scope, files, &o)
+        };
+        if (size_talk
+            && (measure_verbs || pronoun)
+            && !has(
+                &words,
+                &[
+                    "biggest", "largest", "heaviest", "first", "sort", "delete", "remove",
+                ],
+            ))
+            || (has(&words, &["measure", "calculate", "compute"]) && pronoun)
+        {
+            return Some(opts_for(&|o| o.measure_all = true));
+        }
+        if has(&words, &["delete", "remove", "trash", "erase"]) && pronoun {
+            let list = opts_for(&|o| o.measure_all = true);
+            let targets: Vec<FolderTarget> = list
+                .sections
+                .first()?
+                .items
+                .iter()
+                .take(FOLDER_BATCH)
+                .map(|i| FolderTarget {
+                    path: i.path.clone(),
+                    files: i.files,
+                    bytes: i.bytes,
+                    note: i.note.clone(),
+                })
+                .collect();
+            let total: u64 = targets.iter().map(|t| t.bytes).sum();
+            let mut r = reply(
+                &ctx,
+                "trash_named_files",
+                "Understood your request",
+                format!("Move {} project folders to Trash", targets.len()),
+                format!(
+                    "{} ({}) ready for the Trash — each project moves whole and stays recoverable. Uncheck any you want to keep. Nothing happens until you approve.",
+                    plural(targets.len(), "project folder", "project folders"),
+                    bytes(total)
+                ),
+            );
+            r.folders = targets;
+            return Some(r);
+        }
+        if let Some((_, label)) = PROJECT_KIND_WORDS
+            .iter()
+            .find(|(w, _)| words.iter().any(|x| x == w))
+            && has(
+                &words,
+                &[
+                    "only", "just", "which", "show", "list", "filter", "those", "ones", "are",
+                ],
+            )
+        {
+            let label = label.to_string();
+            return Some(opts_for(&|o| o.only_kind = Some(label.clone())));
+        }
+        if has(&words, &["biggest", "largest", "heaviest", "heaviest"])
+            || (size_talk && has(&words, &["sort", "by", "order", "first"]))
+        {
+            return Some(opts_for(&|o| {
+                o.sort = Some("size".into());
+                o.measure_all = true;
+            }));
+        }
+        if has(&words, &["oldest", "stale", "untouched"]) {
+            return Some(opts_for(&|o| o.sort = Some("oldest".into())));
+        }
+        if has(
+            &words,
+            &["alphabetical", "alphabetically", "name", "names", "a-z"],
+        ) && has(
+            &words,
+            &[
+                "sort",
+                "by",
+                "order",
+                "alphabetical",
+                "alphabetically",
+                "a-z",
+            ],
+        ) {
+            return Some(opts_for(&|o| o.sort = Some("name".into())));
+        }
+    }
+    None
 }

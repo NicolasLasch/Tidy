@@ -137,6 +137,33 @@ pub enum ValidatedAction {
         original_size: u64,
         original_modified: i64,
     },
+    /// Puts an item from the Trash back where it was, never replacing anything.
+    Restore {
+        /// The item's current location inside a Trash folder.
+        source: PathBuf,
+        destination: PathBuf,
+        /// The original location inside the scope.
+        relative_source: PathBuf,
+        original_size: u64,
+    },
+    /// Creates an absent folder; undone by sending the (still empty) folder to the Trash.
+    CreateDir {
+        source: PathBuf,
+        relative_source: PathBuf,
+    },
+    /// Moves or renames a whole folder; undone by moving it back.
+    MoveDir {
+        source: PathBuf,
+        destination: PathBuf,
+        relative_source: PathBuf,
+        relative_dest: PathBuf,
+        files: u64,
+        dirs: u64,
+        original_size: u64,
+        /// Not writable by its owner: made writable just for the move to a new parent, then restored.
+        #[serde(default)]
+        read_only: bool,
+    },
     /// A whole folder moved to the native Trash as one reviewed action.
     TrashDir {
         source: PathBuf,
@@ -145,6 +172,10 @@ pub enum ValidatedAction {
         original_modified: i64,
         files: u64,
         dirs: u64,
+        /// The folder is not writable by its owner, which blocks moving it. Approving the plan
+        /// makes it writable just long enough to move it, then restores its permissions.
+        #[serde(default)]
+        read_only: bool,
     },
 }
 
@@ -155,6 +186,9 @@ impl ValidatedAction {
             Self::Rename { source, .. } => source,
             Self::Trash { source, .. }
             | Self::TrashDir { source, .. }
+            | Self::CreateDir { source, .. }
+            | Self::MoveDir { source, .. }
+            | Self::Restore { source, .. }
             | Self::Copy { source, .. }
             | Self::Permissions { source, .. } => source,
         }
@@ -174,6 +208,15 @@ impl ValidatedAction {
             | Self::TrashDir {
                 relative_source, ..
             }
+            | Self::CreateDir {
+                relative_source, ..
+            }
+            | Self::Restore {
+                relative_source, ..
+            }
+            | Self::MoveDir {
+                relative_source, ..
+            }
             | Self::Copy {
                 relative_source, ..
             }
@@ -188,7 +231,12 @@ impl ValidatedAction {
             Self::Move { relative_dest, .. } => Some(relative_dest),
             Self::Rename { relative_dest, .. } => Some(relative_dest),
             Self::Copy { relative_dest, .. } => Some(relative_dest),
-            Self::Trash { .. } | Self::TrashDir { .. } | Self::Permissions { .. } => None,
+            Self::MoveDir { relative_dest, .. } => Some(relative_dest),
+            Self::Trash { .. }
+            | Self::TrashDir { .. }
+            | Self::CreateDir { .. }
+            | Self::Restore { .. }
+            | Self::Permissions { .. } => None,
         }
     }
 
@@ -198,8 +246,11 @@ impl ValidatedAction {
             Self::Rename { original_size, .. } => *original_size,
             Self::Trash { original_size, .. }
             | Self::TrashDir { original_size, .. }
+            | Self::MoveDir { original_size, .. }
+            | Self::Restore { original_size, .. }
             | Self::Copy { original_size, .. }
             | Self::Permissions { original_size, .. } => *original_size,
+            Self::CreateDir { .. } => 0,
         }
     }
 
@@ -209,6 +260,9 @@ impl ValidatedAction {
             Self::Rename { .. } => "rename",
             Self::Trash { .. } => "trash",
             Self::TrashDir { .. } => "trash_dir",
+            Self::CreateDir { .. } => "create_dir",
+            Self::MoveDir { .. } => "move_dir",
+            Self::Restore { .. } => "restore",
             Self::Copy { .. } => "copy",
             Self::Permissions { .. } => "permissions",
         }

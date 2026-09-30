@@ -4,14 +4,12 @@ use std::{
     path::PathBuf,
     sync::Mutex,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
 };
 use tauri::State;
 use tidy_agent_runtime::{
     catalog::{self, ModelSpec},
-    prompt::{self, Evidence},
     store::ModelStore,
-    worker::{Answer, Backend, Worker},
+    worker::Worker,
 };
 #[derive(Deserialize)]
 struct Manifest {
@@ -26,13 +24,18 @@ pub struct AiJob {
     pub scope_id: Option<i64>,
     pub message: String,
     pub downloaded: u64,
-    pub answer: Option<Answer>,
-    pub sampled_files: usize,
-    pub total_indexed: i64,
     pub planning_trace: Vec<tidy_agent_runtime::investigation::Trace>,
-    pub overview: Option<tidy_file_indexer::database::IndexOverview>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    #[serde(default)]
+    custom: Vec<ModelSpec>,
+    #[serde(default)]
+    selected: Option<String>,
 }
 pub struct AiState {
+    saved: Mutex<Saved>,
+    dir: PathBuf,
     pub store: ModelStore,
     pub worker: Worker,
     pub job: Mutex<AiJob>,
@@ -56,7 +59,13 @@ impl AiState {
                 .join("resources/inference")
                 .join(name);
         }
+        let saved = std::fs::read_to_string(data.join("ai_models.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
         Ok(Self {
+            saved: Mutex::new(saved),
+            dir: data.clone(),
             store: ModelStore::new(data.join("models")),
             worker: Worker {
                 executable,
@@ -67,6 +76,39 @@ impl AiState {
             cancel: AtomicBool::new(false),
             downloaded: AtomicU64::new(0),
         })
+    }
+    fn persist(&self, saved: &Saved) -> Result<(), String> {
+        let tmp = self.dir.join("ai_models.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(saved).map_err(display_error)?)
+            .map_err(display_error)?;
+        std::fs::rename(tmp, self.dir.join("ai_models.json")).map_err(display_error)
+    }
+    /// Built-in models plus any the user added from Hugging Face.
+    pub fn models(&self) -> Vec<ModelSpec> {
+        let mut all = catalog::builtin();
+        if let Ok(saved) = self.saved.lock() {
+            all.extend(saved.custom.iter().cloned());
+        }
+        all
+    }
+    pub fn find(&self, id: &str) -> Result<ModelSpec, String> {
+        self.models()
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| "Unknown model".into())
+    }
+    /// The model Tidy will use: the one picked in the chat if it is installed, otherwise the largest
+    /// installed model.
+    pub fn chosen(&self) -> Option<ModelSpec> {
+        let picked = self.saved.lock().ok().and_then(|s| s.selected.clone());
+        let installed: Vec<ModelSpec> = self
+            .models()
+            .into_iter()
+            .filter(|m| self.store.present(m))
+            .collect();
+        picked
+            .and_then(|id| installed.iter().find(|m| m.id == id).cloned())
+            .or_else(|| installed.into_iter().max_by_key(|m| m.bytes))
     }
     pub(super) fn reserve(
         &self,
@@ -98,12 +140,14 @@ impl AiState {
 }
 #[derive(Serialize)]
 pub struct ModelView {
-    spec: &'static ModelSpec,
+    spec: ModelSpec,
     installed: bool,
 }
 #[derive(Serialize)]
 pub struct Status {
     models: Vec<ModelView>,
+    /// The model that will actually be used right now.
+    selected: Option<String>,
     worker_available: bool,
     metal_available: bool,
     job: AiJob,
@@ -113,11 +157,14 @@ pub fn ai_status(state: State<'_, Shared>) -> Result<Status, String> {
     let mut job = lock(&state.ai.job)?.clone();
     job.downloaded = state.ai.downloaded.load(Ordering::Relaxed);
     Ok(Status {
-        models: catalog::MODELS
-            .iter()
+        selected: state.ai.chosen().map(|m| m.id),
+        models: state
+            .ai
+            .models()
+            .into_iter()
             .map(|spec| ModelView {
+                installed: state.ai.store.present(&spec),
                 spec,
-                installed: state.ai.store.present(spec),
             })
             .collect(),
         worker_available: state.ai.worker.bytes > 0 && state.ai.worker.executable.is_file(),
@@ -126,13 +173,52 @@ pub fn ai_status(state: State<'_, Shared>) -> Result<Status, String> {
     })
 }
 #[tauri::command]
+pub fn ai_select_model(model_id: String, state: State<'_, Shared>) -> Result<(), String> {
+    let spec = state.ai.find(&model_id)?;
+    if !state.ai.store.present(&spec) {
+        return Err("Download this model first".into());
+    }
+    let mut saved = lock(&state.ai.saved)?;
+    saved.selected = Some(spec.id);
+    state.ai.persist(&saved)
+}
+/// Looks up a Hugging Face .gguf link (metadata only) and adds it to the list, ready to download.
+#[tauri::command]
+pub async fn add_custom_model(link: String, state: State<'_, Shared>) -> Result<ModelSpec, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let spec = catalog::fetch_hugging_face(&link)?;
+        if state.ai.models().iter().any(|m| m.id == spec.id) {
+            return Err("That model is already in the list".into());
+        }
+        let mut saved = lock(&state.ai.saved)?;
+        saved.custom.push(spec.clone());
+        state.ai.persist(&saved)?;
+        Ok(spec)
+    })
+    .await
+}
+#[tauri::command]
+pub fn remove_custom_model(model_id: String, state: State<'_, Shared>) -> Result<(), String> {
+    let mut saved = lock(&state.ai.saved)?;
+    let Some(at) = saved.custom.iter().position(|m| m.id == model_id) else {
+        return Err("Only models you added can be removed".into());
+    };
+    let spec = saved.custom.remove(at);
+    if saved.selected.as_deref() == Some(model_id.as_str()) {
+        saved.selected = None;
+    }
+    let _ = std::fs::remove_file(state.ai.store.path(&spec));
+    state.ai.persist(&saved)
+}
+#[tauri::command]
 pub fn cancel_ai(state: State<'_, Shared>) {
     state.ai.cancel.store(true, Ordering::Relaxed);
 }
 #[tauri::command]
 pub fn install_model(model_id: String, state: State<'_, Shared>) -> Result<(), String> {
-    let spec = catalog::model(&model_id)?;
-    state.ai.reserve("install", spec.id, None)?;
+    let spec = state.ai.find(&model_id)?;
+    state.ai.reserve("install", &spec.id, None)?;
     let state = state.inner().clone();
     tauri::async_runtime::spawn(async move {
         let worker = state.clone();
@@ -140,7 +226,7 @@ pub fn install_model(model_id: String, state: State<'_, Shared>) -> Result<(), S
             worker
                 .ai
                 .store
-                .install(spec, &worker.ai.cancel, &worker.ai.downloaded)
+                .install(&spec, &worker.ai.cancel, &worker.ai.downloaded)
                 .map(|_| ())
         })
         .await;
@@ -154,92 +240,14 @@ pub fn install_model(model_id: String, state: State<'_, Shared>) -> Result<(), S
     });
     Ok(())
 }
-#[tauri::command]
-pub fn ask_local(
-    scope_id: i64,
-    model_id: String,
-    question: String,
-    backend: Backend,
-    state: State<'_, Shared>,
-) -> Result<(), String> {
-    let spec = catalog::model(&model_id)?;
-    if question.trim().is_empty() || question.len() > 1000 {
-        return Err("Question must contain 1–1,000 UTF-8 bytes".into());
-    }
-    super::selection::require(state.inner(), scope_id)?;
-    state.ai.reserve("inference", spec.id, Some(scope_id))?;
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let worker = state.clone();
-        let result = blocking(move || {
-            let context = lock(&worker.db)?
-                .folder_context(scope_id, &question, &worker.ai.cancel)
-                .map_err(display_error)?;
-            if context.overview.indexed_files == 0 {
-                return Err("Scan this folder first; there are no indexed files to explain".into());
-            }
-            let evidence: Vec<_> = context
-                .examples
-                .into_iter()
-                .map(|f| Evidence {
-                    id: f.id,
-                    path: f.path,
-                    bytes: f.size,
-                    excerpt: f.excerpt,
-                })
-                .collect();
-            let overview_json = serde_json::to_string(&context.overview).map_err(display_error)?;
-            let (prompt, count) = prompt::folder_prompt(&question, &overview_json, &evidence)?;
-            let model = worker.ai.store.verify(spec, &worker.ai.cancel)?;
-            let answer = worker.ai.worker.run(
-                model,
-                &prompt,
-                backend,
-                &worker.ai.cancel,
-                Duration::from_secs(90),
-            )?;
-            lock(&worker.db)?
-                .root(scope_id)
-                .map_err(|_| "Folder was forgotten; response discarded".to_string())?;
-            if worker.ai.cancel.load(Ordering::Relaxed) {
-                return Err("Inference cancelled".into());
-            }
-            Ok((answer, count, context.overview))
-        })
-        .await;
-        if let Ok(mut job) = state.ai.job.lock() {
-            job.running = false;
-            match result {
-                Ok((answer, count, overview)) => {
-                    if state.ai.cancel.load(Ordering::Relaxed)
-                        || lock(&state.db)
-                            .and_then(|db| db.root(scope_id).map_err(display_error))
-                            .is_err()
-                    {
-                        job.message =
-                            "Folder access revoked or request cancelled; response discarded".into();
-                        job.answer = None;
-                        return;
-                    }
-                    job.message = "Local answer ready. Check its claims against the files.".into();
-                    job.answer = Some(answer);
-                    job.sampled_files = count;
-                    job.total_indexed = overview.indexed_files as i64;
-                    job.overview = Some(overview);
-                }
-                Err(e) => job.message = e,
-            };
-        }
-    });
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn serializes_jobs_and_resets_cancel_only_on_new_job() {
         let state = AiState {
+            saved: Mutex::new(Saved::default()),
+            dir: PathBuf::from("unused"),
             store: ModelStore::new(PathBuf::from("unused")),
             worker: Worker {
                 executable: PathBuf::from("unused"),

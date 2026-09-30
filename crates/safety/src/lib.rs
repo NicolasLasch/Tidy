@@ -134,6 +134,19 @@ impl SafetyEngine {
                     validated_actions
                         .push(validator::validate_permissions(scope, relative, *mode)?);
                 }
+                ProposedAction::CreateFolder { path } => {
+                    validated_actions.push(validator::validate_create_dir(scope, path)?);
+                }
+                ProposedAction::MoveFolder {
+                    source,
+                    destination_relative,
+                } => {
+                    validated_actions.push(validator::validate_move_dir(
+                        scope,
+                        source,
+                        destination_relative,
+                    )?);
+                }
                 ProposedAction::Trash { source } => {
                     let relative_src = files_map
                         .get(source)
@@ -210,6 +223,199 @@ impl SafetyEngine {
             .approval_mgr
             .create_approval(tx_id, scope_id, actions, 300);
         Ok(view)
+    }
+
+    /// Puts one trashed item back at its original place. The caller has already shown the user a
+    /// confirmation for this exact item. Nothing is ever replaced, and the action is journaled.
+    pub fn restore_trashed(
+        &self,
+        scope: &AuthorizedRoot,
+        scope_id: i64,
+        tx_id: i64,
+        step_id: i64,
+    ) -> Result<ExecutionReport, Rejection> {
+        #[cfg(not(unix))]
+        {
+            let _ = (scope, scope_id, tx_id, step_id);
+            Err(Rejection::InvalidAction(
+                "Restore is unavailable on this platform".into(),
+            ))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let started = std::time::Instant::now();
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| Rejection::IoError("Safety state unavailable".into()))?;
+            self.journal
+                .check_binding(tx_id, scope, None)
+                .map_err(Rejection::InvalidAction)?;
+            let detail = self
+                .journal
+                .get_transaction_detail(tx_id)
+                .map_err(Rejection::IoError)?
+                .ok_or(Rejection::StaleApproval)?;
+            let step = detail
+                .steps
+                .iter()
+                .find(|s| s.id == step_id)
+                .ok_or(Rejection::StaleApproval)?;
+            if !matches!(step.action_type.as_str(), "trash" | "trash_dir")
+                || step.state != "verified"
+            {
+                return Err(Rejection::InvalidAction(
+                    "Only an item that was moved to the Trash by Tidy can be put back".into(),
+                ));
+            }
+            let (before, _, trash) = self.journal.evidence(step_id).map_err(Rejection::IoError)?;
+            let trash = PathBuf::from(trash.ok_or_else(|| {
+                Rejection::InvalidAction("No Trash location was recorded for this item".into())
+            })?);
+            if !trash
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
+            {
+                return Err(Rejection::InvalidAction(
+                    "Recorded location is not in a Trash folder".into(),
+                ));
+            }
+            let meta = std::fs::symlink_metadata(&trash).map_err(|_| {
+                Rejection::ChangedSource(format!(
+                    "{} is no longer in the Trash (already restored or emptied)",
+                    trash.display()
+                ))
+            })?;
+            let parts: Vec<&str> = before.split(':').collect();
+            let (dev, ino) = if step.action_type == "trash_dir" {
+                (parts.get(1), parts.get(2))
+            } else {
+                (parts.first(), parts.get(1))
+            };
+            if dev.map(|d| d.to_string()) != Some(meta.dev().to_string())
+                || ino.map(|i| i.to_string()) != Some(meta.ino().to_string())
+            {
+                return Err(Rejection::ChangedSource(
+                    "The item in the Trash is not the one Tidy moved".into(),
+                ));
+            }
+            let relative = PathBuf::from(&step.source_relative);
+            let destination = scope.path().join(&relative);
+            if relative.as_os_str().is_empty()
+                || relative.components().any(|c| {
+                    !matches!(c, std::path::Component::Normal(_)) || c.as_os_str() == ".git"
+                })
+                || !destination.starts_with(scope.path())
+            {
+                return Err(Rejection::OutsideScope);
+            }
+            if std::fs::symlink_metadata(&destination).is_ok() {
+                return Err(Rejection::Collision(destination.display().to_string()));
+            }
+            if let Some(parent) = destination.parent() {
+                let nearest = parent
+                    .ancestors()
+                    .find(|p| std::fs::symlink_metadata(p).is_ok())
+                    .ok_or(Rejection::OutsideScope)?;
+                scope
+                    .validate(nearest)
+                    .map_err(|_| Rejection::OutsideScope)?;
+                std::fs::create_dir_all(parent).map_err(|e| Rejection::IoError(e.to_string()))?;
+            }
+            let action = ValidatedAction::Restore {
+                source: trash.clone(),
+                destination: destination.clone(),
+                relative_source: relative,
+                original_size: step.original_size,
+            };
+            let uuid = Uuid::new_v4().to_string();
+            let rationale = format!("Put “{}” back from the Trash", step.source_relative);
+            let new_tx = self
+                .journal
+                .record_prepared(&uuid, scope_id, &rationale, &[action])
+                .map_err(Rejection::IoError)?;
+            self.journal
+                .bind(new_tx, scope, None)
+                .map_err(Rejection::IoError)?;
+            let new_step = self
+                .journal
+                .get_transaction_detail(new_tx)
+                .map_err(Rejection::IoError)?
+                .and_then(|d| d.steps.first().map(|s| s.id))
+                .ok_or(Rejection::StaleApproval)?;
+            self.journal
+                .record_evidence(new_step, &before, None, None)
+                .map_err(Rejection::IoError)?;
+            for state in [JournalState::Approved, JournalState::Applying] {
+                self.journal
+                    .transition_state(new_tx, state)
+                    .map_err(Rejection::IoError)?;
+            }
+            // A read-only folder cannot be renamed out of the Trash to a new parent; make it
+            // writable for the move and put its original mode back afterwards.
+            let trash_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode()
+            };
+            let made_writable = meta.is_dir() && trash_mode & 0o200 == 0;
+            if made_writable {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &trash,
+                    std::fs::Permissions::from_mode(trash_mode | 0o200),
+                )
+                .map_err(|e| {
+                    Rejection::PermissionDenied(format!(
+                        "Could not make the folder writable to put it back: {e}"
+                    ))
+                })?;
+            }
+            let moved = tidy_platform::handles::rename_absolute_no_replace(&trash, &destination);
+            if made_writable {
+                use std::os::unix::fs::PermissionsExt;
+                let target = if moved.is_ok() { &destination } else { &trash };
+                let _ =
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(trash_mode));
+            }
+            if let Err(e) = moved {
+                let _ = self.journal.record_step_result(
+                    new_step,
+                    "needs_recovery",
+                    Some(&e.to_string()),
+                );
+                let _ = self
+                    .journal
+                    .transition_state(new_tx, JournalState::NeedsRecovery);
+                return Err(Rejection::IoError(format!("Could not put it back: {e}")));
+            }
+            let after = std::fs::symlink_metadata(&destination)
+                .map_err(|e| Rejection::IoError(e.to_string()))?;
+            if after.ino() != meta.ino() || after.dev() != meta.dev() {
+                return Err(Rejection::IoError(
+                    "Restored item changed; inspect it manually".into(),
+                ));
+            }
+            self.journal
+                .record_step_result(new_step, "verified", None)
+                .map_err(Rejection::IoError)?;
+            self.journal
+                .record_step_result(step_id, "restored", None)
+                .map_err(Rejection::IoError)?;
+            for state in [JournalState::Applied, JournalState::Verified] {
+                self.journal
+                    .transition_state(new_tx, state)
+                    .map_err(Rejection::IoError)?;
+            }
+            Ok(ExecutionReport {
+                transaction_id: new_tx,
+                tx_uuid: uuid,
+                actions_applied: 1,
+                verified: true,
+                duration_ms: started.elapsed().as_millis() as u64,
+                rationale,
+            })
+        }
     }
 
     /// Consumes the one-use approval token, marks the transaction 'approved' -> 'applying',
@@ -343,7 +549,12 @@ impl SafetyEngine {
             .get_transaction_detail(original_tx_id)
             .map_err(Rejection::IoError)?
             .ok_or(Rejection::StaleApproval)?;
-        let final_state = if report.actions_applied == original.steps.len() {
+        let undoable = original
+            .steps
+            .iter()
+            .filter(|s| s.action_type != "create_dir")
+            .count();
+        let final_state = if report.actions_applied == undoable {
             JournalState::Undone
         } else {
             JournalState::NeedsRecovery
@@ -469,7 +680,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn folder_trash_reviews_whole_tree_and_refuses_git_and_root() {
+    fn folder_trash_reviews_whole_tree_and_refuses_root_files_and_overlaps() {
         let tmp = TestDir::new("folder_trash");
         fs::create_dir_all(tmp.path.join("Game/saves/deep")).unwrap();
         fs::write(tmp.path.join("Game/a.bin"), vec![0u8; 100]).unwrap();
@@ -495,10 +706,11 @@ mod tests {
         fs::write(tmp.path.join("Game/new.bin"), b"late").unwrap();
         assert!(engine.execute_approved_plan(&root, &view.token).is_err());
         assert!(tmp.path.join("Game/a.bin").exists());
+        // A repository folder is trashed whole (recoverable); its .git is never opened.
         assert!(
             engine
-                .request_folder_trash_approval(&root, 1, "git", &[PathBuf::from("Repo")])
-                .is_err()
+                .request_folder_trash_approval(&root, 1, "repo", &[PathBuf::from("Repo")])
+                .is_ok()
         );
         assert!(
             engine
@@ -510,6 +722,151 @@ mod tests {
                 .request_folder_trash_approval(&root, 1, "file", &[PathBuf::from("Game/a.bin")])
                 .is_err()
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trashed_folder_can_be_put_back_once_and_never_over_something() {
+        let tmp = TestDir::new("restore");
+        fs::create_dir_all(tmp.path.join("Keep/inner")).unwrap();
+        fs::write(tmp.path.join("Keep/inner/a.txt"), b"a").unwrap();
+        let root = AuthorizedRoot::authorize(&tmp.path).unwrap();
+        let engine = SafetyEngine::new_in_memory().unwrap();
+        let view = engine
+            .request_folder_trash_approval(&root, 1, "trash", &[PathBuf::from("Keep")])
+            .unwrap();
+        let report = engine.execute_approved_plan(&root, &view.token).unwrap();
+        assert!(!tmp.path.join("Keep").exists());
+        let detail = engine.get_detail(report.transaction_id).unwrap().unwrap();
+        let step = detail.steps[0].id;
+        // Something new now occupies the original place: refuse to overwrite.
+        fs::create_dir(tmp.path.join("Keep")).unwrap();
+        assert!(
+            engine
+                .restore_trashed(&root, 1, report.transaction_id, step)
+                .is_err()
+        );
+        fs::remove_dir(tmp.path.join("Keep")).unwrap();
+        engine
+            .restore_trashed(&root, 1, report.transaction_id, step)
+            .unwrap();
+        assert_eq!(fs::read(tmp.path.join("Keep/inner/a.txt")).unwrap(), b"a");
+        // A second restore has nothing to restore.
+        assert!(
+            engine
+                .restore_trashed(&root, 1, report.transaction_id, step)
+                .is_err()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_folders_are_made_writable_for_the_move_and_restored_after() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TestDir::new("readonly");
+        fs::create_dir_all(tmp.path.join("Locked/inner")).unwrap();
+        fs::write(tmp.path.join("Locked/inner/a.txt"), b"a").unwrap();
+        fs::create_dir_all(tmp.path.join("Other")).unwrap();
+        fs::set_permissions(tmp.path.join("Locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let root = AuthorizedRoot::authorize(&tmp.path).unwrap();
+        let engine = SafetyEngine::new_in_memory().unwrap();
+        // Moving it to another parent works and puts the read-only mode back.
+        let plan = [ProposedAction::MoveFolder {
+            source: "Locked".into(),
+            destination_relative: "Other/Locked".into(),
+        }];
+        let view = engine
+            .request_plan_approval(&root, 1, "move", &plan, &HashMap::new())
+            .unwrap();
+        assert!(matches!(
+            &view.actions[0],
+            ValidatedAction::MoveDir {
+                read_only: true,
+                ..
+            }
+        ));
+        engine.execute_approved_plan(&root, &view.token).unwrap();
+        let mode = |p: &str| fs::metadata(tmp.path.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("Other/Locked"), 0o555);
+        // Trashing it works too, and Put back restores the mode.
+        let view = engine
+            .request_folder_trash_approval(&root, 1, "trash", &[PathBuf::from("Other/Locked")])
+            .unwrap();
+        assert!(matches!(
+            &view.actions[0],
+            ValidatedAction::TrashDir {
+                read_only: true,
+                ..
+            }
+        ));
+        let report = engine.execute_approved_plan(&root, &view.token).unwrap();
+        assert!(!tmp.path.join("Other/Locked").exists());
+        let step = engine
+            .get_detail(report.transaction_id)
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .id;
+        engine
+            .restore_trashed(&root, 1, report.transaction_id, step)
+            .unwrap();
+        assert_eq!(mode("Other/Locked"), 0o555, "original permissions are kept");
+        fs::set_permissions(
+            tmp.path.join("Other/Locked"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn create_and_rename_folders_then_undo_the_rename() {
+        let tmp = TestDir::new("dirs");
+        fs::create_dir_all(tmp.path.join("Old/inner")).unwrap();
+        fs::write(tmp.path.join("Old/inner/a.txt"), b"a").unwrap();
+        let root = AuthorizedRoot::authorize(&tmp.path).unwrap();
+        let engine = SafetyEngine::new_in_memory().unwrap();
+        let files = HashMap::new();
+        let plan = [
+            ProposedAction::CreateFolder {
+                path: PathBuf::from("Archive/2026"),
+            },
+            ProposedAction::MoveFolder {
+                source: PathBuf::from("Old"),
+                destination_relative: PathBuf::from("Archive/2026/New"),
+            },
+        ];
+        let view = engine
+            .request_plan_approval(&root, 1, "restructure", &plan, &files)
+            .unwrap();
+        let report = engine.execute_approved_plan(&root, &view.token).unwrap();
+        assert_eq!(report.actions_applied, 2);
+        assert!(!tmp.path.join("Old").exists());
+        assert_eq!(
+            fs::read(tmp.path.join("Archive/2026/New/inner/a.txt")).unwrap(),
+            b"a"
+        );
+        // Colliding and self-nested moves are refused.
+        assert!(
+            engine
+                .request_plan_approval(
+                    &root,
+                    1,
+                    "into itself",
+                    &[ProposedAction::MoveFolder {
+                        source: PathBuf::from("Archive"),
+                        destination_relative: PathBuf::from("Archive/x"),
+                    }],
+                    &files
+                )
+                .is_err()
+        );
+        let undo = engine
+            .request_undo_approval(&root, report.transaction_id)
+            .unwrap();
+        assert_eq!(undo.actions.len(), 1);
+        assert!(matches!(&undo.actions[0], ValidatedAction::MoveDir { .. }));
+        engine
+            .execute_approved_undo(&root, report.transaction_id, &undo.token)
+            .unwrap();
+        assert_eq!(fs::read(tmp.path.join("Old/inner/a.txt")).unwrap(), b"a");
     }
     #[cfg(unix)]
     #[test]

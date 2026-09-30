@@ -106,12 +106,138 @@ pub fn execute_transaction(
                             .record_evidence(step.id, &before, Some(&after), None)
                             .map_err(Rejection::IoError)?;
                     }
-                    ValidatedAction::TrashDir { source, .. } => {
+                    ValidatedAction::Restore { .. } => {
+                        return Err(Rejection::InvalidAction(
+                            "Put-back runs through its own confirmed step".into(),
+                        ));
+                    }
+                    ValidatedAction::CreateDir {
+                        relative_source, ..
+                    } => {
+                        #[cfg(unix)]
+                        let after =
+                            tidy_platform::handles::create_dir_no_replace(scope, relative_source)
+                                .map_err(|e| Rejection::IoError(e.to_string()))?;
+                        #[cfg(not(unix))]
+                        let after: String = return Err(Rejection::InvalidAction(
+                            "Folder creation unavailable on this platform".into(),
+                        ));
+                        journal
+                            .record_evidence(step.id, &before, Some(&after), None)
+                            .map_err(Rejection::IoError)?;
+                    }
+                    ValidatedAction::MoveDir {
+                        source,
+                        destination,
+                        relative_source,
+                        relative_dest,
+                        read_only,
+                        ..
+                    } => {
+                        // Moving a read-only folder to a different parent needs it writable (its
+                        // ".." entry changes). Restore the original mode afterwards.
+                        #[cfg(unix)]
+                        let original_mode =
+                            if *read_only && relative_source.parent() != relative_dest.parent() {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mode = std::fs::symlink_metadata(source)
+                                    .map_err(|e| Rejection::IoError(e.to_string()))?
+                                    .permissions()
+                                    .mode();
+                                std::fs::set_permissions(
+                                    source,
+                                    std::fs::Permissions::from_mode(mode | 0o200),
+                                )
+                                .map_err(|e| {
+                                    Rejection::PermissionDenied(format!(
+                                        "{} is read-only and Tidy could not make it writable: {e}",
+                                        source.display()
+                                    ))
+                                })?;
+                                Some(mode)
+                            } else {
+                                None
+                            };
+                        #[cfg(not(unix))]
+                        let _ = (read_only, source, destination);
+                        #[cfg(unix)]
+                        let moved = tidy_platform::handles::move_dir_no_replace(
+                            scope,
+                            relative_source,
+                            relative_dest,
+                            &before,
+                        );
+                        #[cfg(unix)]
+                        if let Some(mode) = original_mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            let target = if moved.is_ok() { destination } else { source };
+                            let _ = std::fs::set_permissions(
+                                target,
+                                std::fs::Permissions::from_mode(mode),
+                            );
+                        }
+                        #[cfg(unix)]
+                        let after = moved.map_err(|e| Rejection::IoError(e.to_string()))?;
+                        #[cfg(not(unix))]
+                        let after: String = return Err(Rejection::InvalidAction(
+                            "Folder moves unavailable on this platform".into(),
+                        ));
+                        journal
+                            .record_evidence(step.id, &before, Some(&after), None)
+                            .map_err(Rejection::IoError)?;
+                    }
+                    ValidatedAction::TrashDir {
+                        source, read_only, ..
+                    } => {
                         scope
                             .validate(source)
                             .map_err(|_| Rejection::OutsideScope)?;
-                        let location =
-                            super::native_trash::trash(source).map_err(Rejection::IoError)?;
+                        // A read-only folder cannot be renamed into the Trash. The user approved
+                        // this exact folder, so make it writable for the move and restore it after.
+                        #[cfg(unix)]
+                        let original_mode = if *read_only {
+                            use std::os::unix::fs::PermissionsExt;
+                            let meta = std::fs::symlink_metadata(source)
+                                .map_err(|e| Rejection::IoError(e.to_string()))?;
+                            let mode = meta.permissions().mode();
+                            std::fs::set_permissions(
+                                source,
+                                std::fs::Permissions::from_mode(mode | 0o200),
+                            )
+                            .map_err(|e| {
+                                Rejection::PermissionDenied(format!(
+                                    "{} is read-only and Tidy could not make it writable: {e}",
+                                    source.display()
+                                ))
+                            })?;
+                            Some(mode)
+                        } else {
+                            None
+                        };
+                        #[cfg(not(unix))]
+                        let _ = read_only;
+                        let location = match super::native_trash::trash(source) {
+                            Ok(location) => location,
+                            Err(e) => {
+                                #[cfg(unix)]
+                                if let Some(mode) = original_mode {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = std::fs::set_permissions(
+                                        source,
+                                        std::fs::Permissions::from_mode(mode),
+                                    );
+                                }
+                                return Err(Rejection::IoError(e));
+                            }
+                        };
+                        #[cfg(unix)]
+                        if let Some(mode) = original_mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &location,
+                                std::fs::Permissions::from_mode(mode),
+                            );
+                        }
                         let receipt = location.to_str().ok_or_else(|| {
                             Rejection::IoError(
                                 "Trash receipt is not UTF-8; manual recovery required".into(),
@@ -262,6 +388,26 @@ pub fn prepare_undo(
                 scope,
                 Path::new(&step.source_relative),
                 old,
+            )?);
+            continue;
+        }
+        if step.action_type == "create_dir" {
+            // Created folders stay (they may now hold moved files); undo restores everything else.
+            continue;
+        }
+        if step.action_type == "move_dir" {
+            let dest = step
+                .destination_relative
+                .as_ref()
+                .ok_or(Rejection::StaleApproval)?;
+            let (_, after, _) = journal.evidence(step.id).map_err(Rejection::IoError)?;
+            if after.as_deref() != Some(&validator::fingerprint_dir(scope, Path::new(dest))?) {
+                return Err(Rejection::ChangedSource(dest.clone()));
+            }
+            actions.push(validator::validate_move_dir(
+                scope,
+                Path::new(dest),
+                Path::new(&step.source_relative),
             )?);
             continue;
         }

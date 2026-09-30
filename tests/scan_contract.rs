@@ -69,7 +69,7 @@ fn refuses_relative_traversal_files_and_missing_roots() {
     }
 }
 #[test]
-fn git_directories_and_worktrees_are_omitted() {
+fn git_internals_are_omitted_but_repository_files_are_managed() {
     let f = Fixture::new();
     for name in ["repo", "worktree"] {
         fs::create_dir(f.0.join(name)).unwrap();
@@ -78,18 +78,21 @@ fn git_directories_and_worktrees_are_omitted() {
     fs::create_dir(f.0.join("repo/.git")).unwrap();
     f.file("worktree/.git", b"gitdir: elsewhere");
     let r = run(&f);
-    assert!(r.files.is_empty());
+    // Working files are indexed; only the .git directory / worktree pointer is left alone.
+    assert_eq!(r.files.len(), 2);
     assert_eq!(r.issues.len(), 2);
-    assert!(AuthorizedRoot::authorize(f.0.join("repo")).is_err());
+    assert!(AuthorizedRoot::authorize(f.0.join("repo")).is_ok());
     fs::create_dir(f.0.join("repo/sub")).unwrap();
-    assert!(AuthorizedRoot::authorize(f.0.join("repo/sub")).is_err());
+    assert!(AuthorizedRoot::authorize(f.0.join("repo/sub")).is_ok());
+    assert!(AuthorizedRoot::authorize(f.0.join("repo/.git")).is_err());
 }
 #[test]
-fn rechecks_git_marker_after_authorization() {
+fn git_marker_created_after_authorization_is_skipped_not_fatal() {
     let f = Fixture::new();
     let root = f.root();
     f.file(".git", b"gitdir: elsewhere");
-    assert!(scan(&root, &ScanLimits::default(), &AtomicBool::new(false)).is_err());
+    let report = scan(&root, &ScanLimits::default(), &AtomicBool::new(false)).unwrap();
+    assert!(report.files.is_empty());
 }
 #[test]
 fn entry_budget_includes_directories() {

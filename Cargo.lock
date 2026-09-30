@@ -3734,12 +3734,13 @@ dependencies = [
  "tidy-file-indexer",
  "tidy-organization",
  "tidy-platform",
+ "tidy-safety",
  "tidy-storage",
 ]
 
 [[package]]
 name = "tidy-desktop"
-version = "0.8.2"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",

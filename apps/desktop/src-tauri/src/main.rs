@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod ai;
+mod disk;
 mod planning;
 mod safety_ipc;
 mod selection;
-mod storage_overview;
 use serde::Serialize;
 use std::{
     sync::{
@@ -16,7 +16,7 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tidy_file_indexer::{
     AuthorizedRoot,
-    database::{Index, Page, Scope},
+    database::{Index, Scope},
     index_scan::{self, IndexOptions, Omission},
 };
 
@@ -31,9 +31,9 @@ struct JobView {
 struct AppState {
     ai: ai::AiState,
     db: Mutex<Index>,
-    folder_cache: Mutex<Option<storage_overview::CachedFolders>>,
     job: Mutex<JobView>,
     safety: Arc<tidy_safety::SafetyEngine>,
+    disk: Arc<disk::DiskState>,
     selected: Mutex<std::collections::HashSet<i64>>,
     data_dir: std::path::PathBuf,
     activity: Mutex<()>,
@@ -84,33 +84,6 @@ async fn list_scopes(state: State<'_, Shared>) -> Result<Vec<Scope>, String> {
     blocking(move || lock(&state.db)?.scopes().map_err(display_error)).await
 }
 #[tauri::command]
-async fn search_files(
-    scope_id: i64,
-    query: String,
-    size_sort: bool,
-    offset: u32,
-    state: State<'_, Shared>,
-) -> Result<Page, String> {
-    let state = state.inner().clone();
-    blocking(move || {
-        lock(&state.db)?
-            .search(scope_id, &query, size_sort, offset)
-            .map_err(display_error)
-    })
-    .await
-}
-#[tauri::command]
-async fn list_scope_files(
-    scope_id: i64,
-    state: State<'_, Shared>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let state = state.inner().clone();
-    blocking(move || {
-        Ok(lock(&state.db)?.current_files(scope_id).map_err(display_error)?.into_iter().map(|f| serde_json::json!({"id":f.id,"display":f.display,"path":f.path,"size":f.size,"modified":f.modified})).collect())
-    })
-    .await
-}
-#[tauri::command]
 fn scan_status(state: State<'_, Shared>) -> Result<JobView, String> {
     let mut view = lock(&state.job)?.clone();
     view.visited = state.progress.load(Ordering::Relaxed);
@@ -134,10 +107,9 @@ async fn forget_folder(scope_id: i64, state: State<'_, Shared>) -> Result<(), St
             state.cancel.store(true, Ordering::Relaxed);
         }
         {
-            let mut ai = lock(&state.ai.job)?;
+            let ai = lock(&state.ai.job)?;
             if ai.scope_id == Some(scope_id) {
                 state.ai.cancel.store(true, Ordering::Relaxed);
-                ai.answer = None;
             }
         }
         selection::deselect(&state, scope_id)?;
@@ -235,15 +207,15 @@ fn set_compact_mode(app: tauri::AppHandle, compact: bool) -> Result<(), String> 
     let window = app.get_webview_window("main").ok_or("Window unavailable")?;
     if compact {
         window
-            .set_min_size(Some(LogicalSize::new(340.0, 460.0)))
+            .set_min_size(Some(LogicalSize::new(320.0, 440.0)))
             .map_err(display_error)?;
         window
-            .set_size(LogicalSize::new(400.0, 680.0))
+            .set_size(LogicalSize::new(360.0, 580.0))
             .map_err(display_error)?;
         if let Some(monitor) = window.current_monitor().map_err(display_error)? {
             let scale = monitor.scale_factor();
             let (size, origin) = (monitor.size(), monitor.position());
-            let x = origin.x as f64 + size.width as f64 - (400.0 + 16.0) * scale;
+            let x = origin.x as f64 + size.width as f64 - (360.0 + 16.0) * scale;
             let y = origin.y as f64 + 44.0 * scale;
             window
                 .set_position(PhysicalPosition::new(x, y))
@@ -319,43 +291,45 @@ fn main() {
                 ai,
                 activity: Mutex::new(()),
                 db: Mutex::new(db),
-                folder_cache: Mutex::new(None),
                 job: Mutex::new(JobView::default()),
                 safety: Arc::new(safety),
+                disk: Arc::new(disk::DiskState::load(&path)),
                 selected: Mutex::new(selection::load(&path)),
                 data_dir: path.clone(),
                 cancel: AtomicBool::new(false),
                 progress: AtomicUsize::new(0),
             }));
+            disk::warm(&app.state::<Shared>().disk);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             choose_folder,
             list_scopes,
-            list_scope_files,
-            safety_ipc::reveal_indexed_file,
             safety_ipc::reveal_trash_file,
-            search_files,
+            safety_ipc::restore_from_trash,
+            safety_ipc::file_id_for_path,
             scan_status,
             start_scan,
             cancel_scan,
             forget_folder,
             ai::ai_status,
             ai::install_model,
-            ai::ask_local,
+            ai::ai_select_model,
+            ai::add_custom_model,
+            ai::remove_custom_model,
             ai::cancel_ai,
             set_compact_mode,
+            disk::disk_start,
+            disk::disk_status,
+            disk::disk_home,
+            disk::reveal_path,
+            disk::authorize_path,
+            disk::open_full_disk_access,
+            disk::open_external,
             selection::ai_selection,
             selection::set_ai_selected,
-            storage_overview::storage_all_folders,
-            storage_overview::storage_overview,
-            storage_overview::storage_folder_page,
-            storage_overview::use_working_folder,
-            planning::workflow_catalog,
             planning::analyze_storage_scope,
-            planning::propose_organization,
             planning::plan_with_agent,
-            planning::propose_storage_cleanup,
             safety_ipc::request_plan_approval,
             safety_ipc::request_folder_trash_approval,
             safety_ipc::execute_approved_plan,

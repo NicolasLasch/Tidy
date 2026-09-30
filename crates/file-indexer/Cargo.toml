@@ -8,10 +8,6 @@ rust-version.workspace = true
 [dependencies]
 tidy-platform.workspace = true
 
-[[bin]]
-name = "tidy-scan"
-path = "src/main.rs"
-
 [[test]]
 name = "scan_contract"
 path = "../../tests/scan_contract.rs"

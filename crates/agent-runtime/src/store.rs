@@ -25,7 +25,7 @@ impl ModelStore {
     }
     pub fn verify(&self, model: &ModelSpec, cancel: &AtomicBool) -> Result<PathBuf, String> {
         let path = self.path(model);
-        verify_file(&path, model.bytes, model.sha256, cancel)?;
+        verify_file(&path, model.bytes, &model.sha256, cancel)?;
         Ok(path)
     }
     pub fn install(
@@ -67,7 +67,7 @@ impl ModelStore {
             .build()
             .map_err(|e| e.to_string())?;
         let response = client
-            .get(model.url)
+            .get(&model.url)
             .send()
             .and_then(|r| r.error_for_status())
             .map_err(|e| format!("Model download failed: {e}"))?;
@@ -226,18 +226,19 @@ mod tests {
     }
     fn spec() -> ModelSpec {
         ModelSpec {
-            id: "fixture",
-            name: "Test fixture",
+            id: "fixture".into(),
+            name: "Test fixture".into(),
             bytes: 8,
-            sha256: "",
-            url: "https://example.invalid",
-            license: "MIT",
-            source: "test",
+            sha256: String::new(),
+            url: "https://example.invalid".into(),
+            license: "MIT".into(),
+            source: "test".into(),
+            custom: false,
         }
     }
     fn model_spec() -> ModelSpec {
         ModelSpec {
-            sha256: "707e858183f1bb2cbf58e1ef07c195adac4bf20bfc9a5827f63f17170fc78f8b",
+            sha256: "707e858183f1bb2cbf58e1ef07c195adac4bf20bfc9a5827f63f17170fc78f8b".into(),
             ..spec()
         }
     }
@@ -245,7 +246,7 @@ mod tests {
     fn install(store: &ModelStore, data: &[u8], cancel: bool) -> Result<PathBuf, String> {
         let hash = format!("{:x}", Sha256::digest(b"GGUFtest"));
         let mut model = model_spec();
-        model.sha256 = Box::leak(hash.into_boxed_str());
+        model.sha256 = hash;
         store.install_reader(&model, data, &AtomicBool::new(cancel), &AtomicU64::new(0))
     }
     #[test]

@@ -265,6 +265,27 @@ impl Index {
         tx.commit()
     }
     /// Reconcile only journal-verified changes; avoid a full blocking rescan after execution.
+    /// Re-paths every indexed file below a moved or renamed folder.
+    pub fn rename_tree(&mut self, scope: i64, from: &Path, to: &Path) -> rusqlite::Result<usize> {
+        let mut prefix = path_bytes(from);
+        prefix.push(b'/');
+        let tx = self.connection.transaction()?;
+        let rows: Vec<(i64, Vec<u8>)> = tx
+            .prepare("SELECT id,path FROM files WHERE scope_id=?1 AND length(path)>?2 AND substr(path,1,?2)=?3")?
+            .query_map(params![scope, prefix.len() as i64, prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut moved = 0;
+        for (id, old) in rows {
+            let new = to.join(path_from_bytes(old[prefix.len()..].to_vec()));
+            tx.execute(
+                "UPDATE files SET path=?1,display=?2 WHERE id=?3",
+                params![path_bytes(&new), new.to_string_lossy(), id],
+            )?;
+            moved += 1;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
     /// Forgets a trashed folder and every indexed path below it.
     pub fn remove_tree(&mut self, scope: i64, dir: &Path) -> rusqlite::Result<usize> {
         let mut prefix = path_bytes(dir);

@@ -28,19 +28,19 @@ jobs:
       id-token: write        # build provenance attestation
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/native
           key: worker-${{ runner.os }}-${{ hashFiles('scripts/build-worker.mjs', 'native/inference/**') }}
@@ -90,11 +90,11 @@ jobs:
           } >> release-notes.md
 
       # Attestations need a public repository; skipped while the repo is private.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         if: ${{ !github.event.repository.private }}
         with:
           subject-path: dist-release/*
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           name: Tidy ${{ env.TAG }}

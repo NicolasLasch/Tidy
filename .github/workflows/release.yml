@@ -89,7 +89,9 @@ jobs:
             echo "Verify the download: \`shasum -a 256 -c SHA256SUMS.txt\`. Requires macOS 11+; Apple Silicon recommended for local AI."
           } >> release-notes.md
 
+      # Attestations need a public repository; skipped while the repo is private.
       - uses: actions/attest-build-provenance@v2
+        if: ${{ !github.event.repository.private }}
         with:
           subject-path: dist-release/*
       - uses: softprops/action-gh-release@v2

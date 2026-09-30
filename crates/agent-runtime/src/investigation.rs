@@ -1426,7 +1426,7 @@ mod tests {
         assert_eq!(result.proposal.actions.len(), 1);
         assert!(result.complete);
         assert!(
-            matches!(&result.proposal.actions[0],ProposedAction::Move{destination_relative,..} if destination_relative.to_string_lossy()=="Holiday/2024/Originals/PNG/photo.png")
+            matches!(&result.proposal.actions[0],ProposedAction::Move{destination_relative,..} if destination_relative.to_string_lossy().replace('\\', "/")=="Holiday/2024/Originals/PNG/photo.png")
         );
     }
     #[test]

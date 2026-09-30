@@ -1848,7 +1848,7 @@ mod tests {
     fn dev_artifacts_become_folders() {
         let r = run("clean up node_modules and build artifacts");
         assert_eq!(r.folders.len(), 1);
-        assert_eq!(r.folders[0].path, "proj/node_modules");
+        assert_eq!(r.folders[0].path.replace('\\', "/"), "proj/node_modules");
         assert_eq!(r.folders[0].files, 2);
     }
     #[test]

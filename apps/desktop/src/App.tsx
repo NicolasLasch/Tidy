@@ -258,10 +258,10 @@ export default function App() {
             baseId={baseId}
             onBase={setBaseId}
             selected={selected}
-            onToggleBase={(id, on) => void toggleBase(id, on)}
+            onToggleBase={(id: number, on: boolean) => void toggleBase(id, on)}
             onToggleFolder={toggleFolder}
             onAdd={() => void add()}
-            onAsk={(text, id) => {
+            onAsk={(text: string, id: number) => {
               if (!selected.has(id)) {
                 setError("Switch this folder on first so Tidy is allowed to work in it.");
                 return;

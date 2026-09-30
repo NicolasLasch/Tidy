@@ -1880,3 +1880,174 @@ mod tests {
         );
     }
 }
+
+/// True for "list/show my projects" style requests.
+pub fn wants_projects(request: &str) -> bool {
+    let words = tokens(request.rsplit("User follow-up:").next().unwrap_or(request));
+    has(
+        &words,
+        &[
+            "project",
+            "projects",
+            "repo",
+            "repos",
+            "repositories",
+            "codebases",
+            "apps",
+        ],
+    ) && has(
+        &words,
+        &[
+            "list", "show", "find", "what", "which", "all", "every", "give", "display", "where",
+            "my", "have", "got", "see",
+        ],
+    ) && !has(
+        &words,
+        &[
+            "delete", "remove", "trash", "erase", "organize", "sort", "group",
+        ],
+    )
+}
+const PROJECT_MARKERS: &[(&str, &str)] = &[
+    (".git", "Git"),
+    ("package.json", "Node"),
+    ("Cargo.toml", "Rust"),
+    ("pyproject.toml", "Python"),
+    ("setup.py", "Python"),
+    ("requirements.txt", "Python"),
+    ("go.mod", "Go"),
+    ("pom.xml", "Java"),
+    ("build.gradle", "Gradle"),
+    ("build.gradle.kts", "Gradle"),
+    ("Package.swift", "Swift"),
+    ("CMakeLists.txt", "C/C++"),
+    ("Gemfile", "Ruby"),
+    ("composer.json", "PHP"),
+    ("pubspec.yaml", "Flutter"),
+    ("index.html", "Web"),
+];
+/// Finds projects by their marker files on disk (Git repositories are not in the file index, so the
+/// index alone would miss them). Read-only, no-follow, bounded.
+pub fn list_projects(root: &Path, scope: &str, files: &[FileCandidate]) -> Investigation {
+    let ctx = Ctx {
+        files,
+        scope,
+        now: 0,
+    };
+    let folders = folders_of(files);
+    let skip = [
+        "node_modules",
+        "target",
+        ".build",
+        "Pods",
+        "venv",
+        ".venv",
+        "__pycache__",
+        "Library",
+        "DerivedData",
+        "dist",
+        "build",
+    ];
+    let mut found: Vec<(PathBuf, Vec<&str>, std::time::SystemTime)> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        visited += 1;
+        if visited > 30_000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut kinds: Vec<&str> = Vec::new();
+        let mut subdirs = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if let Some((_, label)) = PROJECT_MARKERS.iter().find(|(m, _)| *m == name) {
+                if !(name == "index.html" && !kind.is_file()) && !kinds.contains(label) {
+                    kinds.push(label);
+                }
+            }
+            if name.ends_with(".xcodeproj") || name.ends_with(".xcworkspace") {
+                if !kinds.contains(&"Xcode") {
+                    kinds.push("Xcode");
+                }
+            }
+            if kind.is_dir()
+                && !kind.is_symlink()
+                && !name.starts_with('.')
+                && !skip.contains(&name.as_str())
+                && !name.ends_with(".app")
+                && !name.ends_with(".xcodeproj")
+                && !name.ends_with(".xcworkspace")
+            {
+                subdirs.push(entry.path());
+            }
+        }
+        // A bare index.html or requirements.txt alone is weak evidence; require a stronger marker at depth 0 of the scope.
+        let strong = kinds.iter().any(|k| !matches!(*k, "Web"));
+        if !kinds.is_empty() && (strong || dir != root) && dir != root {
+            let modified = std::fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.push((dir, kinds, modified));
+            continue;
+        }
+        if depth < 5 {
+            for sub in subdirs {
+                stack.push((sub, depth + 1));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut text = if found.is_empty() {
+        format!(
+            "I looked through {scope} and found no folders that look like projects (no package.json, Cargo.toml, .git, and so on)."
+        )
+    } else {
+        format!(
+            "I found {} in {scope}, most recently changed first:",
+            plural(found.len(), "project", "projects")
+        )
+    };
+    for (path, kinds, modified) in found.iter().take(60) {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let size = folders
+            .iter()
+            .find(|f| f.path == rel)
+            .map(|f| format!(" · {}", bytes(f.bytes)))
+            .unwrap_or_default();
+        let days = std::time::SystemTime::now()
+            .duration_since(*modified)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        let age = match days {
+            0 => "today".to_string(),
+            1 => "yesterday".into(),
+            d if d < 60 => format!("{d} days ago"),
+            d => format!("{} months ago", d / 30),
+        };
+        text.push_str(&format!(
+            "\n• {} ({}) — {}{size} · {age}",
+            rel.display(),
+            kinds.join(", "),
+            rel.display()
+        ));
+    }
+    if found.len() > 60 {
+        text.push_str(&format!("\n…and {} more.", found.len() - 60));
+    }
+    if !found.is_empty() {
+        text.push_str("\n\nSay “delete <project name>” to move one to the Trash, or “what’s taking space?” to see the heaviest.");
+    }
+    reply(
+        &ctx,
+        "find_project",
+        "Looked for project markers",
+        format!("Scanned folder structure below {scope}"),
+        text,
+    )
+}

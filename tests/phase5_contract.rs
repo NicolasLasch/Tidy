@@ -154,6 +154,11 @@ fn journey_downloads_approved_execution_and_undo() {
 
 #[test]
 fn native_trash_moves_file_and_verifies_without_permanent_deletion() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Native trash recovery receipts are supported on macOS; other platforms fail closed
+        return;
+    }
     let tmp = TempDir::new("trash_test");
     let root = AuthorizedRoot::authorize(&tmp.path).unwrap();
 

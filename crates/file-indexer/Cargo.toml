@@ -1,0 +1,32 @@
+[package]
+name = "tidy-file-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tidy-platform.workspace = true
+
+[[bin]]
+name = "tidy-scan"
+path = "src/main.rs"
+
+[[test]]
+name = "scan_contract"
+path = "../../tests/scan_contract.rs"
+
+[dependencies.rusqlite]
+version = "0.37"
+features = ["bundled"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.sha2]
+version = "0.10"
+
+[[test]]
+name = "phase2_contract"
+path = "../../tests/phase2_contract.rs"

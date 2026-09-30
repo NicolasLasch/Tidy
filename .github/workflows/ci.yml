@@ -1,0 +1,83 @@
+name: CI - Build & Test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core Workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Verify code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run unit & contract tests (offline verification)
+        run: cargo test --locked --offline
+
+      - name: Run Clippy checks with zero warnings
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+
+  desktop:
+    name: Desktop App & Tauri Bundle (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build frontend application (TypeScript & Vite)
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Build pinned native inference worker
+        working-directory: apps/desktop
+        run: npm run worker:build
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Clippy check on full workspace
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+
+      - name: Build Tauri desktop development bundle
+        working-directory: apps/desktop
+        run: npm run tauri -- build --debug --bundles app

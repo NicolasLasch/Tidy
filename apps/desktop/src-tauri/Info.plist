@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSDownloadsFolderUsageDescription</key><string>Tidy reads folders you select to build a local file index.</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Tidy reads folders you select to build a local file index.</string>
+<key>NSDesktopFolderUsageDescription</key><string>Tidy reads folders you select to build a local file index.</string>
+</dict></plist>

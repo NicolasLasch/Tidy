@@ -1,0 +1,22 @@
+# Phase 5 reliability revision (0.5.1)
+
+This revision replaces unsafe behavior found in the earlier implementation. It is not a claim that the old “88 tests passed” report proves these changes correct. At the user's request, automated execution tests and manual UI/file-operation tests have not been run by Codex. Rust/test-source compilation and frontend/application builds are separate checks.
+
+## Changes
+
+* Moves use handle-relative, no-follow directory traversal and atomic no-replace rename on macOS/Linux. No overwrite/copy-delete fallback exists. Sources are checked against their recorded identity, size and nanosecond modification/change timestamps immediately before execution. Moves verify resulting identity and size/timestamps, persist result fingerprints and sync parent directories.
+* Approval preparation compares source fingerprints against the index. Root replacement, stale file evidence and destination symlinks are rejected. A plan is limited to 500 actions; repeated sources and duplicate destinations are rejected. A batch is sequential, not an all-or-nothing filesystem transaction: a later failure can leave earlier verified actions applied.
+* The safety engine serializes execution and undo. An advisory instance lock prevents two updated Tidy processes from opening/recovering the same journal. Desktop scans, revocation and mutations coordinate to avoid concurrent conflicting jobs.
+* The journal additively stores root identity, undo linkage and per-step before/after fingerprints. An undo token is bound to its original transaction. Undo refuses changed files. Legacy transactions without this evidence remain visible but cannot be automatically undone. No historical data is deleted by this migration.
+* macOS Trash uses NSFileManager and records the actual resulting Trash URL. History can reveal that location in Finder. **Trash restore is manual through Finder; automatic Trash undo is not implemented.** Trashing a directory as an unreviewed subtree is refused. Windows execution remains disabled until native safety/recovery support is implemented.
+* Failed operations become `needs_recovery`. Known verified move steps can be reversed with approval. An interrupted/unverified step requires manual inspection; Tidy does not guess that it was completed or automatically roll it back. Empty directories created for approved destinations remain after undo.
+* The index reconciles only the current transaction's verified steps. Completion no longer waits for a full folder rescan. Errors are returned instead of silently ignoring journal/index failures. After interruption or external edits, explicitly rescan.
+* Category/date/custom organization acts on loose top-level files. Nested project/dependency structures remain in place. Project grouping is explicit. Plans retain whole-index deterministic coverage; optional AI can review at most 20 eligible files without replacing the rest or introducing Trash actions. AI is off by default and can be cancelled into rules-based fallback.
+* Storage starts with an empty selection. Cleanup rejects a kept duplicate or selection of every member of a known duplicate group. A zero-item selection cannot fall through into automatic bulk cleanup. Duplicate detection still covers cached hashes only; current scan budgets mean not every file is hashed. Candidate sizes are logical bytes, not measured freed space, and Trash does not immediately release storage.
+* File names in organization/storage previews now reveal authorized indexed files in Finder. Storage lists render bounded pages; scope changes remount review state. IPC file maps omit saved excerpts/hashes that are not needed for display. Debug SHA-256 code is optimized without skipping integrity checks.
+
+## Remaining limits
+
+Use `manual-verification.md` before approving any real folder cleanup. Compilation is not functional verification. Native Trash uses a path-based OS API; it is revalidated but does not provide a kernel-level transaction against concurrent edits by other processes. Do not change the reviewed directory while operations run. Interrupted native Trash calls may require inspecting Finder Trash when the process exits before recording its receipt. Recovery is conservative, not automatic rollback.
+
+Model quality, model latency on target 8 GB hardware, large-file hash coverage, Windows execution and the full floating UI remain separate work. Original design references are in `docs/design` for Phase 6.

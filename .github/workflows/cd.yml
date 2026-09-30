@@ -1,0 +1,85 @@
+name: CD - Release Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to release (e.g. v0.8.1)'
+        required: false
+        default: ''
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-macos:
+    name: Package Desktop Application (macOS)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build frontend application
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Build pinned native inference worker
+        working-directory: apps/desktop
+        run: npm run worker:build
+
+      - name: Build production self-contained app bundle
+        working-directory: apps/desktop
+        run: npm run package
+
+      - name: Archive macOS bundle & generate checksums
+        run: |
+          VERSION="${{ github.ref_name }}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="latest"
+          fi
+
+          mkdir -p artifacts
+          cd target/release/bundle/macos
+          tar -czf ../../../../artifacts/Tidy-macos-${VERSION}.tar.gz Tidy.app
+          zip -r ../../../../artifacts/Tidy-macos-${VERSION}.zip Tidy.app
+          cd ../../../..
+
+          cd artifacts
+          shasum -a 256 Tidy-macos-${VERSION}.tar.gz Tidy-macos-${VERSION}.zip > SHA256SUMS.txt
+          cd ..
+
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != ''
+        with:
+          name: "Tidy ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/Tidy-macos-*.tar.gz
+            artifacts/Tidy-macos-*.zip
+            artifacts/SHA256SUMS.txt

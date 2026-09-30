@@ -1,0 +1,11 @@
+{
+  "identifier": "main",
+  "description": "Local Tidy window; window dragging only. No filesystem or shell plugin permissions.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}

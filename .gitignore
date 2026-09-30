@@ -1,0 +1,15 @@
+/target/
+node_modules/
+dist/
+*.gguf
+.DS_Store
+*.tsbuildinfo
+apps/desktop/src-tauri/gen/
+*.sqlite3*
+apps/desktop/src-tauri/resources/inference/tidy-inference-worker*
+*.log
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/

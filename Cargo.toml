@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/*", "apps/desktop/src-tauri"]
+default-members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+tidy-platform = { path = "crates/platform" }
+tidy-file-indexer = { path = "crates/file-indexer" }
+
+[profile.dev.package.sha2]
+opt-level = 3

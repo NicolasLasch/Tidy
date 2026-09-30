@@ -1,0 +1,22 @@
+[package]
+name = "tidy-desktop"
+version = "0.8.1"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+serde = { version = "1", features = ["derive"] }
+tidy-file-indexer = { path = "../../../crates/file-indexer" }
+tidy-platform = { path = "../../../crates/platform" }
+tidy-agent-runtime = { path = "../../../crates/agent-runtime" }
+tidy-organization = { path = "../../../crates/organization" }
+tidy-storage = { path = "../../../crates/storage" }
+tidy-safety = { path = "../../../crates/safety" }
+serde_json = "1"

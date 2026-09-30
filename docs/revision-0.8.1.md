@@ -1,0 +1,11 @@
+# Tidy 0.8.1 — one continuous chat
+
+Ask Tidy has one message composer at the bottom. Requests and answers append to the same message stream; there is no separate Your request form or This conversation/reply panel. Sending clears the input and retains the sent message. Enter sends, Shift+Enter adds a newline, and composing IME input does not submit. Workflow selection and Clear conversation are under collapsed Options.
+
+Live progress and the actual investigation/tool activity appear inside Tidy's pending response. Completed activity is attached to the corresponding assistant message in an expandable Investigation section. This is observable runtime activity, not hidden model reasoning. The latest plan's workflow, exact file review and approval controls are attached to that same assistant response. No duplicated summary is shown. Old replies remain readable; a follow-up replaces the active proposal and invalidates any outstanding approval.
+
+Replies to clarification and brief refinements retain the current request. Other messages start a new operation within the same visible conversation, using the latest instruction while providing bounded recent conversational context to the local planner. After applying a plan, the next message starts a fresh operation without clearing chat history. Scope/session context and existing model budgets remain bounded; chat is not persisted across app restarts. Clear conversation is an explicit reset within the same pane.
+
+The mascot overlay is hidden on Ask Tidy so it cannot obscure the composer; it remains on the other pages. Approval, safety, inference tools and filesystem behavior are unchanged from 0.8.0.
+
+Verification: frontend TypeScript and production build pass. The macOS debug app was rebuilt. No visual/model/file-operation tests were run, as requested. Manual checks: send a request, answer Tidy in the same composer, verify both messages remain; watch live Investigation inside its response; expand saved activity; confirm one textbox and no second chat panel; test Enter/Shift+Enter; review/cancel a proposal; ask a new operation after applying a disposable plan and verify history remains. Confirm v0.8.1 after quitting the older app and reopening the built app.

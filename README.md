@@ -76,7 +76,7 @@ Tidy features an automated CI/CD pipeline powered by GitHub Actions:
   - **Zero-Warning Enforcement**: Enforces `cargo clippy --all-targets --locked --offline -- -D warnings` and `cargo fmt --all -- --check`.
   - **Desktop Build & Verification**: Validates the complete desktop application, TypeScript typechecks, Vite production bundle, native inference worker build, and Tauri macOS packaging.
 - **Continuous Delivery (`.github/workflows/cd.yml`)**:
-  - Automatically triggered whenever a version tag (e.g. `v0.8.1`, `v1.0.0` – `v7.0.0`) is pushed.
+  - Automatically triggered whenever a version tag (e.g. `v0.8.2`, `v1.0.0` – `v7.0.0`) is pushed.
   - Builds the production, self-contained macOS application package (`Tidy.app`).
   - Generates `.tar.gz`, `.zip` distribution bundles, and cryptographic `SHA256SUMS.txt`.
   - Automatically creates a GitHub Release and attaches the packaged release binaries.

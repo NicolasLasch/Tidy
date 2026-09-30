@@ -1,4 +1,3 @@
-import StorageOverview from "./StorageOverview";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -70,23 +69,13 @@ export default function StorageAnalyzer({
   scopeName,
   onRefreshNeeded,
   snapshot,
-  refreshKey,
   scanning,
-  onSelectScope,
-  onAddFolder,
-  onUseWorkingFolder,
-  working,
 }: {
   scopeId: number | null;
   scopeName?: string;
   onRefreshNeeded?: () => void;
   snapshot: number | null;
-  refreshKey: number;
   scanning: boolean;
-  onSelectScope: (id: number) => void;
-  onAddFolder: () => void;
-  onUseWorkingFolder: (path: string) => void;
-  working: boolean;
 }) {
   const analysisVersion = useRef(0);
   const [analyzing, setAnalyzing] = useState(false);
@@ -96,7 +85,6 @@ export default function StorageAnalyzer({
   const [cleanupProposal, setCleanupProposal] = useState<Proposal | null>(null);
   const [proposingCleanup, setProposingCleanup] = useState(false);
 
-  const [folderSelectionNote, setFolderSelectionNote] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(100);
   // Phase 5 Safety Execution & Approval state
   const [approvalView, setApprovalView] = useState<ApprovalView | null>(null);
@@ -169,32 +157,6 @@ export default function StorageAnalyzer({
     } else if (scopeId !== null && isTauri()) void runAnalysis();
   }, [scopeId, snapshot, scanning]);
 
-  function selectFolderContents(path: string) {
-    const kept = new Set(duplicateGroups.map((g) => g.keptId));
-    const candidates = [...filesMap.values()]
-      .filter(
-        (f) =>
-          (!path || f.path.startsWith(path + "/")) &&
-          !kept.has(f.id) &&
-          !f.path
-            .split("/")
-            .some(
-              (part) =>
-                [".git"].includes(part) ||
-                part.toLowerCase().endsWith(".app") ||
-                part.toLowerCase().endsWith(".framework"),
-            ),
-      )
-      .sort((a, b) => b.size - a.size || a.path.localeCompare(b.path));
-    const batch = candidates.slice(0, 500);
-    setSelectedIds(new Set(batch.map((f) => f.id)));
-    setCleanupProposal(null);
-    setApprovalView(null);
-    setFolderSelectionNote(
-      `Selected ${batch.length} of ${candidates.length} eligible files in ${path || "this root"} for review. The folder itself is not a Trash action.`,
-    );
-  }
-
   async function runAnalysis() {
     if (scopeId === null || scanning) return;
     const version = ++analysisVersion.current;
@@ -202,7 +164,6 @@ export default function StorageAnalyzer({
     setAnalyzing(true);
     setCleanupProposal(null);
     setApprovalView(null);
-    setFolderSelectionNote("");
     try {
       const res = await invoke<StorageAnalysisResult>("analyze_storage_scope", {
         scopeId,
@@ -634,28 +595,6 @@ export default function StorageAnalyzer({
 
   return (
     <div className="planner-container">
-      <StorageOverview
-        scopeId={scopeId}
-        refreshKey={`${snapshot}-${refreshKey}`}
-        scanning={scanning}
-        onSelectScope={onSelectScope}
-        onAddFolder={onAddFolder}
-        onUseWorkingFolder={onUseWorkingFolder}
-        working={working}
-        onSelectContents={selectFolderContents}
-        canSelect={
-          !!result &&
-          !analyzing &&
-          !executing &&
-          !requestingApproval &&
-          !proposingCleanup &&
-          !approvalView &&
-          !cleanupProposal
-        }
-      />
-      {folderSelectionNote && (
-        <p className="storage-selection-note">{folderSelectionNote}</p>
-      )}
       <p className="ai-footnote">
         Duplicate findings cover saved hashes from optional content indexing
         only. Files without hashes are not confirmed unique. Sizes are logical

@@ -234,20 +234,30 @@ fn set_compact_mode(app: tauri::AppHandle, compact: bool) -> Result<(), String> 
     use tauri::{LogicalSize, PhysicalPosition};
     let window = app.get_webview_window("main").ok_or("Window unavailable")?;
     if compact {
-        window.set_min_size(Some(LogicalSize::new(340.0, 460.0))).map_err(display_error)?;
-        window.set_size(LogicalSize::new(400.0, 680.0)).map_err(display_error)?;
+        window
+            .set_min_size(Some(LogicalSize::new(340.0, 460.0)))
+            .map_err(display_error)?;
+        window
+            .set_size(LogicalSize::new(400.0, 680.0))
+            .map_err(display_error)?;
         if let Some(monitor) = window.current_monitor().map_err(display_error)? {
             let scale = monitor.scale_factor();
             let (size, origin) = (monitor.size(), monitor.position());
             let x = origin.x as f64 + size.width as f64 - (400.0 + 16.0) * scale;
             let y = origin.y as f64 + 44.0 * scale;
-            window.set_position(PhysicalPosition::new(x, y)).map_err(display_error)?;
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(display_error)?;
         }
         window.set_always_on_top(true).map_err(display_error)?;
     } else {
         window.set_always_on_top(false).map_err(display_error)?;
-        window.set_min_size(Some(LogicalSize::new(760.0, 560.0))).map_err(display_error)?;
-        window.set_size(LogicalSize::new(1120.0, 760.0)).map_err(display_error)?;
+        window
+            .set_min_size(Some(LogicalSize::new(760.0, 560.0)))
+            .map_err(display_error)?;
+        window
+            .set_size(LogicalSize::new(1120.0, 760.0))
+            .map_err(display_error)?;
         window.center().map_err(display_error)?;
     }
     Ok(())

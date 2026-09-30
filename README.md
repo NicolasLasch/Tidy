@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/public/logo.png" width="120" alt="Tidy — a broom and a leaf" />
+<img src="docs/assets/banner.webp" width="100%" alt="Tidy — Make room for what matters. See your storage. Review every change. Put it back." />
 
 # Tidy
 

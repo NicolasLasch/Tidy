@@ -114,6 +114,9 @@ export default function ChatView({
   const end = useRef<HTMLDivElement>(null);
   // The last request that produced a listing, so follow-ups (“why no size?”, “measure them”) have context.
   const lastListing = useRef<string | null>(null);
+  // A request with several tasks (trash folders + rename a file): the Trash step is approved first and the
+  // remaining steps are carried forward so nothing the user asked for is dropped.
+  const nextSteps = useRef<{ plan: Plan; actions: Action[] } | null>(null);
   const scope = scopes.find((s) => s.id === scopeId) ?? null;
   const lastPlan = [...messages].reverse().find((m) => m.plan)?.plan;
   const activePlan =
@@ -225,6 +228,7 @@ export default function ChatView({
     setError("");
     try {
       let view: Approval;
+      nextSteps.current = null;
       if (undoId !== null) {
         view = await invoke<Approval>("request_undo_approval", {
           scopeId,
@@ -234,6 +238,7 @@ export default function ChatView({
         // A folder inside another chosen folder moves with it; send only the outer ones.
         const chosen = pickedFolders.map((f) => f.path);
         const outer = chosen.filter((p) => !chosen.some((o) => o !== p && p.startsWith(o + "/")));
+        if (activePlan && pickedActions?.length) nextSteps.current = { plan: activePlan, actions: pickedActions };
         view = await invoke<Approval>("request_folder_trash_approval", {
           scopeId,
           folders: outer,
@@ -277,6 +282,8 @@ export default function ChatView({
         (a) => a.type === "trash" || a.type === "trash_dir",
       );
       setLastTx({ id: report.transaction_id, reversible: !trashed });
+      const next = undoTarget === null ? nextSteps.current : null;
+      nextSteps.current = null;
       setMessages((m) => [
         ...m,
         {
@@ -284,14 +291,19 @@ export default function ChatView({
           text:
             undoTarget !== null
               ? "Restored. Everything is back where it was."
-              : trashed
-                ? `Done — ${approval.actions_count} ${approval.actions_count === 1 ? "item" : "items"} moved to the Trash. You can put them back from Finder’s Trash.`
-                : `Done — ${report.actions_applied} changes applied and verified. Find them in History to undo.`,
+              : next
+                ? `Step 1 done — ${approval.actions_count} ${approval.actions_count === 1 ? "item" : "items"} moved to the Trash (recoverable from Finder). Next: ${next.actions.length} more ${next.actions.length === 1 ? "change" : "changes"} from your request. Review to apply.`
+                : trashed
+                  ? `Done — ${approval.actions_count} ${approval.actions_count === 1 ? "item" : "items"} moved to the Trash. You can put them back from Finder’s Trash.`
+                  : `Done — ${report.actions_applied} changes applied and verified. Find them in History to undo.`,
+          plan: next
+            ? { ...next.plan, folders: [], pick: false, proposal: { ...next.plan.proposal, actions: next.actions } }
+            : undefined,
         },
       ]);
       setApproval(null);
       setUndoTarget(null);
-      setPicked(new Set());
+      setPicked(next ? new Set(next.actions.map(key)) : new Set());
       onRefresh();
     } catch (e) {
       const txId = approval.tx_id;

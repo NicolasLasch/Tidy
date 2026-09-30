@@ -1771,6 +1771,9 @@ pub fn respond_in(
         }
     }
     let last = if follow.is_empty() { first } else { follow };
+    if let Some(r) = multi_task(&ctx, last, &folders) {
+        return Some(r);
+    }
     interpret(&ctx, last, &folders).or_else(|| {
         if last != request.trim() {
             interpret(&ctx, request, &folders)
@@ -2093,6 +2096,117 @@ mod tests {
             f(11, "Downloads/photo.png", 50, 0),
             f(12, "Downloads/Screenshot 2026-01-01.png", 60, 0),
         ]
+    }
+    fn games_fixture() -> Vec<FileCandidate> {
+        vec![
+            f(1, "Games/Crossover/a.txt", 100, 0),
+            f(2, "Games/liveandhell-template/x.txt", 100, 0),
+            f(3, "Games/Beer and Plunder/y.txt", 100, 0),
+            f(4, "Games/Pokemon Games/z.txt", 100, 0),
+            f(5, "Games/clocktower-final/c.txt", 100, 0),
+            f(6, "Videos/fin retour bateau.mp4", 5_000, 0),
+        ]
+    }
+    #[test]
+    fn several_tasks_in_one_message_become_one_plan() {
+        let q = "delete crossover, life and hell, beer and plunder and pokemon games. Then rename fin retour bateau.mp4 to BSLFILMBateau.mp4";
+        let r = respond(q, &games_fixture(), "Documents", 9_000_000_100).expect("handled");
+        let trashed: Vec<&str> = r.folders.iter().map(|f| f.path.as_str()).collect();
+        for want in [
+            "Crossover",
+            "liveandhell-template",
+            "Beer and Plunder",
+            "Pokemon Games",
+        ] {
+            assert!(
+                trashed.iter().any(|p| p.ends_with(want)),
+                "{want} missing: {trashed:?} / {}",
+                r.proposal.rationale
+            );
+        }
+        assert!(
+            !trashed.iter().any(|p| p.contains("clocktower")),
+            "{trashed:?}"
+        );
+        assert_eq!(r.proposal.actions.len(), 1, "{}", r.proposal.rationale);
+        match &r.proposal.actions[0] {
+            ProposedAction::Rename { source, new_name } => {
+                assert_eq!(*source, FileId(6));
+                assert_eq!(new_name, "BSLFILMBateau.mp4");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !r.proposal.rationale.contains("Not included"),
+            "{}",
+            r.proposal.rationale
+        );
+    }
+    #[test]
+    fn a_file_name_with_an_extension_never_matches_a_folder() {
+        // “fin” must not fuzzy-match the clocktower-final folder.
+        let r = respond(
+            "rename fin retour bateau.mp4 to BSLFILMBateau.mp4",
+            &games_fixture(),
+            "Documents",
+            9_000_000_100,
+        )
+        .expect("handled");
+        assert!(matches!(
+            r.proposal.actions.as_slice(),
+            [ProposedAction::Rename { source, .. }] if *source == FileId(6)
+        ));
+        let r = respond(
+            "rename nothing here.mp4 to x.mp4",
+            &games_fixture(),
+            "Documents",
+            9_000_000_100,
+        )
+        .expect("handled");
+        assert!(r.proposal.actions.is_empty() && r.clarification.is_some());
+    }
+    #[test]
+    fn tasks_are_split_on_sentences_and_then() {
+        assert_eq!(
+            split_tasks("delete a b. Then rename c.mp4 to d.mp4"),
+            vec!["delete a b", "rename c.mp4 to d.mp4"]
+        );
+        assert_eq!(
+            split_tasks(
+                "delete old.log and then move setup.dmg into Archive, after that create a folder Z"
+            ),
+            vec![
+                "delete old.log",
+                "move setup.dmg into Archive",
+                "create a folder Z"
+            ]
+        );
+        assert_eq!(split_tasks("rename x.mp4 to y.mp4").len(), 1);
+    }
+    #[test]
+    fn a_task_that_cannot_be_understood_is_named_not_dropped() {
+        let r = respond(
+            "delete old.log files older than 3 months. Then frobnicate the widgets",
+            &fixture(),
+            "Documents",
+            9_000_000_100,
+        );
+        let r = r.expect("handled");
+        // With a single understood task the normal path still answers; with two, the rest is named.
+        let q = "delete old.log files older than 3 months. Then rename setup.dmg to Installer. Then frobnicate the widgets";
+        let r2 = respond(q, &fixture(), "Documents", 9_000_000_100).expect("handled");
+        assert!(
+            r2.proposal.rationale.contains("Not included"),
+            "{}",
+            r2.proposal.rationale
+        );
+        assert!(
+            r2.proposal.rationale.contains("frobnicate"),
+            "{}",
+            r2.proposal.rationale
+        );
+        assert!(!r2.proposal.actions.is_empty());
+        let _ = r;
     }
     fn only_action(q: &str) -> ProposedAction {
         let r = run(q);
@@ -2916,6 +3030,168 @@ fn folder_exists(path: &Path, files: &[FileCandidate], folders: &[Folder]) -> bo
     folders.iter().any(|f| f.path == path) || files.iter().any(|f| f.relative_path == path)
 }
 /// Move / rename / create-folder requests. Names keep the capitalization the user typed.
+/// A name like `movie.mp4` is a file: never fuzzy-match it to a folder.
+fn looks_like_file(word: &str) -> bool {
+    match word.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
+}
+/// The indexed file a spoken name refers to (extension optional), shallowest path first.
+fn find_file_named<'a>(ctx: &'a Ctx, subject: &[String]) -> Option<&'a FileCandidate> {
+    let needle = alnum(
+        &subject
+            .iter()
+            .filter(|w| !matches!(w.as_str(), "file" | "files"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(""),
+    );
+    if needle.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<&FileCandidate> = ctx
+        .files
+        .iter()
+        .filter(|f| {
+            f.relative_path.file_name().is_some_and(|n| {
+                let n = alnum(&n.to_string_lossy());
+                n == needle || n.starts_with(&needle) && needle.len() > 3
+            })
+        })
+        .collect();
+    hits.sort_by_key(|f| f.relative_path.components().count());
+    hits.first().copied()
+}
+/// Splits one message into the separate tasks it asks for: sentences, and “… then …” / “after that …”.
+fn split_tasks(text: &str) -> Vec<String> {
+    let text = text.replace('\n', " . ");
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut tasks: Vec<Vec<&str>> = vec![vec![]];
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let bare = w
+            .to_lowercase()
+            .trim_matches(|c| matches!(c, ',' | '.' | ';' | '!'))
+            .to_string();
+        let after_that = bare == "after"
+            && words
+                .get(i + 1)
+                .is_some_and(|n| n.to_lowercase().starts_with("that"));
+        if matches!(bare.as_str(), "then" | "afterwards" | "afterward") || after_that {
+            // A sequencing word starts the next task; at the start of a task it is just dropped.
+            if !tasks.last().unwrap().is_empty() {
+                if tasks
+                    .last()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("and"))
+                {
+                    tasks.last_mut().unwrap().pop();
+                }
+                tasks.push(vec![]);
+            }
+            i += if after_that { 2 } else { 1 };
+            continue;
+        }
+        if w == "." || w == ";" {
+            tasks.push(vec![]);
+            i += 1;
+            continue;
+        }
+        tasks.last_mut().unwrap().push(w);
+        if w.len() > 1 && w.ends_with(['.', '!', '?', ';']) {
+            tasks.push(vec![]);
+        }
+        i += 1;
+    }
+    tasks
+        .into_iter()
+        .map(|t| {
+            t.join(" ")
+                .trim_matches(|c: char| matches!(c, ',' | ';' | '.' | '!' | ' '))
+                .to_string()
+        })
+        .filter(|t| t.split_whitespace().count() >= 2)
+        .collect()
+}
+/// Several tasks in one message (“delete A and B. Then rename C to D”): each task is understood on its
+/// own and they are merged into ONE reviewable plan. A task that can’t be understood is named, never dropped.
+fn multi_task(ctx: &Ctx, text: &str, folders: &[Folder]) -> Option<Investigation> {
+    let tasks = split_tasks(text);
+    if tasks.len() < 2 {
+        return None;
+    }
+    // “rename X to Y, then move it into Z” is one two-step job, handled as a single plan.
+    let raw = raw_tokens(text);
+    let words = tokens(text);
+    if multi_step(ctx, &raw, &words, folders).is_some_and(|r| !r.proposal.actions.is_empty()) {
+        return None;
+    }
+    let mut merged: Option<Investigation> = None;
+    let mut steps: Vec<String> = vec![];
+    let mut skipped: Vec<String> = vec![];
+    for task in &tasks {
+        let Some(r) = interpret(ctx, task, folders) else {
+            skipped.push(format!("“{task}” — I didn’t understand this part"));
+            continue;
+        };
+        let has_plan = !r.proposal.actions.is_empty() || !r.folders.is_empty();
+        if !has_plan || r.pick || !r.sections.is_empty() {
+            let why = if r.proposal.rationale.is_empty() {
+                "nothing matched".to_string()
+            } else {
+                r.proposal.rationale.clone()
+            };
+            skipped.push(format!("“{task}” — {why}"));
+            continue;
+        }
+        steps.push(r.proposal.rationale.clone());
+        match merged.as_mut() {
+            None => merged = Some(r),
+            Some(m) => {
+                m.proposal.actions.extend(r.proposal.actions);
+                m.sources.extend(r.sources);
+                m.folders.extend(r.folders);
+                m.trace.extend(r.trace);
+                m.examined += r.examined;
+                m.remaining_matches += r.remaining_matches;
+                m.complete &= r.complete;
+            }
+        }
+    }
+    let mut m = merged?;
+    m.workflow = Some("multi_task".into());
+    let mixed = !m.folders.is_empty() && !m.proposal.actions.is_empty();
+    let mut text = format!(
+        "{} tasks, one plan — {}\n",
+        steps.len(),
+        if mixed {
+            "everything is listed below. The Trash step is approved first, then the rest follows:"
+        } else {
+            "review everything below and approve once:"
+        }
+    );
+    for (i, step) in steps.iter().enumerate() {
+        text.push_str(&format!("\n{}. {}", i + 1, step.trim()));
+    }
+    if !skipped.is_empty() {
+        text.push_str("\n\nNot included:");
+        for s in &skipped {
+            text.push_str(&format!("\n• {s}"));
+        }
+        text.push_str("\nSay those again on their own and I’ll prepare them.");
+    }
+    m.proposal.rationale = text;
+    m.clarification = None;
+    Some(m)
+}
 const MOVE_VERBS: &[&str] = &["move", "put", "send", "relocate", "transfer", "shift"];
 const DEST_MARKERS: &[&str] = &["to", "into", "in", "inside", "under", "within", "onto"];
 fn is_connector(word: &str) -> bool {
@@ -3080,9 +3356,11 @@ fn rename_and_move(
             text,
         )
     };
-    if let Some(folder) = resolve(subject, folders)
-        .into_iter()
-        .find(|f| f.path != dest_dir)
+    let names_a_file = subject.last().is_some_and(|w| looks_like_file(w));
+    if !names_a_file
+        && let Some(folder) = resolve(subject, folders)
+            .into_iter()
+            .find(|f| f.path != dest_dir)
     {
         let dest = dest_dir.join(new_name);
         if dest.starts_with(&folder.path) {
@@ -3121,26 +3399,7 @@ fn rename_and_move(
             vec![],
         ));
     }
-    let needle = alnum(
-        &subject
-            .iter()
-            .filter(|w| !matches!(w.as_str(), "file" | "files"))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(""),
-    );
-    let mut hits: Vec<&FileCandidate> = ctx
-        .files
-        .iter()
-        .filter(|f| {
-            f.relative_path.file_name().is_some_and(|n| {
-                let n = alnum(&n.to_string_lossy());
-                n == needle || n.starts_with(&needle) && needle.len() > 3
-            })
-        })
-        .collect();
-    hits.sort_by_key(|f| f.relative_path.components().count());
-    let Some(file) = hits.first() else {
+    let Some(file) = find_file_named(ctx, subject) else {
         let mut r = nothing(
             "Looked for what to rename and move",
             format!(
@@ -3234,8 +3493,9 @@ fn structural(
         if subject.is_empty() || new_name.is_empty() || new_name.contains('/') {
             return None;
         }
-        // Folder first, then a file with that name.
-        if let Some(folder) = resolve(&subject, folders).first() {
+        // Folder first, then a file with that name. A name with an extension (movie.mp4) is a file.
+        let names_a_file = subject.last().is_some_and(|w| looks_like_file(w));
+        if !names_a_file && let Some(folder) = resolve(&subject, folders).first() {
             let dest = folder.path.with_file_name(&new_name);
             let text = if folder_exists(&dest, ctx.files, folders) {
                 format!(
@@ -3270,19 +3530,24 @@ fn structural(
                 vec![],
             ));
         }
-        let needle = alnum(&subject.join(""));
-        let mut hits: Vec<&FileCandidate> = ctx
-            .files
-            .iter()
-            .filter(|f| {
-                f.relative_path.file_name().is_some_and(|n| {
-                    alnum(&n.to_string_lossy()) == needle
-                        || alnum(&n.to_string_lossy()).starts_with(&needle) && needle.len() > 3
-                })
-            })
-            .collect();
-        hits.sort_by_key(|f| f.relative_path.components().count());
-        let file = hits.first()?;
+        let Some(file) = find_file_named(ctx, &subject) else {
+            if names_a_file {
+                let mut r = reply(
+                    ctx,
+                    "rename_descriptive",
+                    "Looked for the file",
+                    "No indexed file matched".into(),
+                    format!(
+                        "I couldn’t find a file called “{}” in {}. Nothing changed.",
+                        raw[at + 1..split].join(" "),
+                        ctx.scope
+                    ),
+                );
+                r.clarification = Some(r.proposal.rationale.clone());
+                return Some(r);
+            }
+            return None;
+        };
         let ext = file
             .relative_path
             .extension()

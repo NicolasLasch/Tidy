@@ -52,6 +52,8 @@ impl AiState {
         } else {
             "tidy-inference-worker"
         };
+        // Only reassigned in debug builds (dev fallback to the source tree).
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut executable = resource.join("inference").join(name);
         #[cfg(debug_assertions)]
         if !executable.exists() {
